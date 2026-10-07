@@ -1,0 +1,32 @@
+# Real PAN-OS configuration exports
+*.xml
+*.xml.gz
+
+# Explicitly allow the synthetic test fixture
+!samples/synthetic-safe-config.xml
+
+# Generated reports
+reports/
+reports-*/
+*.html
+*.csv
+*.log
+
+# Secrets / private material
+.env
+private/
+samples/private/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# OS / editor noise
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+_renders/
+myenv/

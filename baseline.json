@@ -1,0 +1,40 @@
+{
+  "weak_encryption": [
+    "des",
+    "3des"
+  ],
+  "weak_hash": [
+    "md5",
+    "sha1",
+    "sha-1"
+  ],
+  "weak_dh_groups": [
+    "group1",
+    "group2",
+    "group5"
+  ],
+  "rule_score": {
+    "source_any": 2,
+    "destination_any": 2,
+    "from_any": 2,
+    "to_any": 2,
+    "application_any": 3,
+    "service_any": 2,
+    "missing_security_profile": 2,
+    "missing_log_end": 1,
+    "missing_log_forwarding": 1
+  },
+  "rule_thresholds": {
+    "critical": 12,
+    "high": 9,
+    "medium": 6,
+    "low": 3
+  },
+  "scanner_policy": {
+    "version": "2.2",
+    "firewall_model": "contextual",
+    "critical_requires_exposure_context": true,
+    "application_any_alone_is_finding": false,
+    "explicit_appid_application_default_is_mitigating": true
+  }
+}
