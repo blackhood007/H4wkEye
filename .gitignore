@@ -30,3 +30,7 @@ Thumbs.db
 .idea/
 _renders/
 myenv/
+
+# H4wkEye generated report files
+*.pdf
+H4wkEye-report.json
