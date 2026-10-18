@@ -2,6 +2,17 @@
 
 All changes below describe the development lineage and should not be interpreted as full PAN-OS version certification.
 
+## 3.0.10: Standalone coverage diagnostics and combined CSV reporting
+- Add optional batch-only `--combined-csv` output, independent of individual `--format` selections.
+- Consolidated findings include privacy-safe configuration identification and scan status; failed scans remain in `batch-summary.json`.
+- Document combined reporting and add synthetic batch regression tests.
+- Add privacy-safe structural entry counts for local rules and selected network, VPN, authentication and logging paths.
+- Separate `NO_LOCAL_RULES` from `NOT_DETERMINED` effective-policy status; no inventory-only findings.
+- Report zero-byte input as `EMPTY_FILE`.
+- Fix contradictory partial-coverage notes when configuration-level findings exist.
+- Warn on redaction-like XML element names without teaching the scanner nonstandard tag aliases.
+- Retain `--format` selection and the existing Panorama reference/provenance diagnostics.
+
 ## Unreleased: optional report format update (based on v3.0.9)
 
 ### Added

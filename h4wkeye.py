@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-H4wkEye v3.0.1
+H4wkEye v3.0.10
 Standard-library-only, read-only XML configuration assessment.
 
 Usage:
@@ -25,7 +25,7 @@ from collections import Counter, defaultdict
 from datetime import datetime
 from pathlib import Path
 
-VERSION = "3.0.9"
+VERSION = "3.0.10"
 
 DEFAULT_BASELINE = {
     "weak_encryption": ["des", "3des"],
@@ -226,6 +226,8 @@ class Scanner:
     def __init__(self, xml_path, baseline):
         self.xml_path = Path(xml_path)
         self.baseline = baseline
+        if self.xml_path.stat().st_size == 0:
+            raise ValueError("EMPTY_FILE: XML input is zero bytes")
         reject_unsafe_xml(self.xml_path)
         self.tree = ET.parse(self.xml_path)
         self.root = self.tree.getroot()
@@ -1738,8 +1740,8 @@ def write_json(path, data):
     Path(path).write_text(json.dumps(data, indent=2), encoding="utf-8")
 
 
-def write_csv(path, findings):
-    fields = [
+def csv_fields():
+    return [
         "finding_id",
         "severity", "confidence", "status", "section", "title", "object",
         "scope", "risk_score", "source_zones", "source_objects",
@@ -1747,8 +1749,11 @@ def write_csv(path, findings):
         "resolved_destinations", "applications", "services",
         "description", "evidence", "remediation",
     ]
+
+
+def write_csv(path, findings):
     with open(path, "w", newline="", encoding="utf-8-sig") as f:
-        writer = csv.DictWriter(f, fieldnames=fields, extrasaction="ignore")
+        writer = csv.DictWriter(f, fieldnames=csv_fields(), extrasaction="ignore")
         writer.writeheader()
         writer.writerows(findings)
 
@@ -2351,7 +2356,65 @@ def load_baseline(path):
     return baseline
 
 
-def detect_coverage(scanner):
+# Paths are structural only. Counting configured entries is different from
+# counting parent containers, and no inventory-only data becomes a finding.
+CONFIG_ENTRY_PATHS = {
+    "interfaces": ("./devices/entry/network/interface//entry",),
+    "zones": ("./devices/entry/vsys/entry/zone/entry",),
+    "virtual_routers": ("./devices/entry/network/virtual-router/entry",),
+    "ike_gateways": ("./devices/entry/network/ike/gateway/entry",),
+    "ipsec_tunnels": ("./devices/entry/network/tunnel/ipsec/entry",),
+    "globalprotect_portals": ("./devices/entry/network/global-protect/global-protect-portal/entry",),
+    "globalprotect_gateways": ("./devices/entry/network/global-protect/global-protect-gateway/entry",),
+    "authentication_profiles": ("./shared/authentication-profile/entry", "./devices/entry/vsys/entry/authentication-profile/entry"),
+    "interface_management_profiles": ("./devices/entry/network/profiles/interface-management-profile/entry",),
+    "log_forwarding_profiles": ("./shared/log-settings/profiles/entry", "./devices/entry/vsys/entry/log-settings/profiles/entry"),
+}
+
+
+def standalone_coverage_inventory(scanner):
+    """Privacy-safe counts, not an effective configuration or assessment claim."""
+    root = scanner.root
+    panorama = bool(root.findall(".//device-group/entry") or
+                    root.findall(".//device-groups/entry") or
+                    root.findall(".//template/entry") or
+                    root.findall(".//template-stack/entry"))
+    result = {"schema_version": "1.0", "source_type": "panorama" if panorama else "standalone_or_other"}
+    if panorama:
+        result["note"] = "Standalone inventory not applied to Panorama; inherited/effective settings unresolved"
+        return result
+    counts = {}
+    for category, paths in CONFIG_ENTRY_PATHS.items():
+        # Some valid sections contain nested entries; these are structural counts,
+        # not necessarily distinct configured interface instances.
+        counts[category] = sum(len(root.findall(path)) for path in paths)
+    local = {}
+    for kind in ("security", "nat", "decryption"):
+        local[kind] = len(root.findall(f"./devices/entry/vsys/entry/rulebase/{kind}/rules/entry"))
+    unexpected = Counter()
+    for elem in root.iter():
+        tag = elem.tag.rsplit("}", 1)[-1] if isinstance(elem.tag, str) else ""
+        if "redacted" in tag.lower():
+            # Only generic category counts, never export actual unknown tag names.
+            unexpected["redaction_like_element_names"] += 1
+    result.update({
+        "local_policy_entries": local,
+        "configuration_entry_counts": counts,
+        "deviceconfig_present": bool(root.findall("./devices/entry/deviceconfig")),
+        "local_policy_status": "PRESENT" if any(local.values()) else "NO_LOCAL_RULES",
+        "effective_policy_status": "NOT_DETERMINED",
+        "structure_warnings": dict(unexpected),
+        "limitations": [
+            "Counts are structural and do not prove that a section was security-assessed.",
+            "Absent local rules do not establish absence of Panorama-pushed rules.",
+            "Container presence alone does not establish configured VPN or security objects.",
+            "Device configuration and runtime/effective policy are not fully evaluated.",
+        ],
+    })
+    return result
+
+
+def detect_coverage(scanner, configuration_coverage=None):
     """Conservative coverage signal, not a claim that a device is secure."""
     root = scanner.root
     tag = str(root.tag).split("}")[-1]
@@ -2365,17 +2428,19 @@ def detect_coverage(scanner):
                     root.findall(".//device-groups/entry") or
                     root.findall(".//template/entry") or
                     root.findall(".//template-stack/entry"))
-    # These structures are meaningful even when no current detector evaluates them.
-    policy_containers = sum(1 for e in root.iter()
-                            if e.tag in ("pre-rulebase", "post-rulebase", "rulebase"))
     if tag not in ("config", "response"):
         return "PARTIAL", "Unrecognized XML root; assessment coverage not verified"
-    if assessed == 0:
-        return "PARTIAL", "No supported assessable objects discovered; zero findings are inconclusive"
     if panorama:
         return "PARTIAL", "Panorama detected; template inheritance and effective policy are not fully resolved"
+    if assessed == 0:
+        if scanner.findings:
+            return "PARTIAL", ("No supported policy/VPN/profile objects discovered; "
+                               "configuration-level findings exist, but assessment coverage is incomplete")
+        return "PARTIAL", ("No supported assessable policy/VPN/profile objects discovered; "
+                           "zero findings are inconclusive")
+    policy_containers = any(e.tag in ("pre-rulebase", "post-rulebase", "rulebase") for e in root.iter())
     if policy_containers and inventory.get("Security rules", 0) == 0:
-        return "PARTIAL", "Policy containers detected but no security rules parsed"
+        return "PARTIAL", "Policy containers detected but no security rules parsed; effective policy not determined"
     return "COMPLETED", "Supported configuration sections assessed; not a security certification"
 
 
@@ -2764,11 +2829,12 @@ def normalized_configuration_diagnostics(scanner):
         ],
     }
 
-def scan_one(xml_path, out, baseline, privacy, formats=None):
+def scan_one(xml_path, out, baseline, privacy, formats=None, combined_writer=None):
     formats = set(formats or ("html", "pdf", "csv", "json"))
     scanner = Scanner(xml_path, baseline)
     scanner.run()
-    status, coverage_note = detect_coverage(scanner)
+    configuration_coverage = standalone_coverage_inventory(scanner)
+    status, coverage_note = detect_coverage(scanner, configuration_coverage)
     data = scanner.output_data()
     diagnostics = panorama_diagnostics(scanner)
     data["metadata"]["scan_status"] = status
@@ -2788,6 +2854,7 @@ def scan_one(xml_path, out, baseline, privacy, formats=None):
     diagnostic_export = privacy_safe_panorama_diagnostics(diagnostics)
     diagnostic_export["reference_audit"] = audit_policy_references(scanner)
     diagnostic_export["normalized_model"] = normalized_configuration_diagnostics(scanner)
+    diagnostic_export["configuration_coverage"] = configuration_coverage
     diagnostic_export["address_resolution"] = {
         "strategy": "exact-policy-scope-then-shared; no unrelated device-group fallback",
         "counts": dict(scanner.resolution_statistics),
@@ -2798,6 +2865,11 @@ def scan_one(xml_path, out, baseline, privacy, formats=None):
                              if k not in ("policy_scopes", "device_groups", "templates", "template_stacks")}
     write_json(diagnostic_path, diagnostic_export)
     chmod_private(diagnostic_path)
+    if combined_writer is not None:
+        config_label = (xml_path.name if privacy == "standard" else
+                        hashlib.sha256(xml_path.name.encode()).hexdigest()[:12])
+        for finding in data["findings"]:
+            combined_writer.writerow({**finding, "configuration": config_label, "scan_status": status})
     if "json" in formats:
         write_json(outputs["json"], data)
     if "csv" in formats:
@@ -2821,6 +2893,11 @@ def scan_one(xml_path, out, baseline, privacy, formats=None):
                          hashlib.sha256(xml_path.name.encode()).hexdigest()[:12],
         "status": status,
         "coverage_note": coverage_note,
+        "configuration_coverage": {
+            "local_policy_status": configuration_coverage.get("local_policy_status", "NOT_APPLICABLE"),
+            "effective_policy_status": configuration_coverage.get("effective_policy_status", "NOT_DETERMINED"),
+            "structure_warning_count": sum(configuration_coverage.get("structure_warnings", {}).values()),
+        },
         "pdf_status": ("NOT_REQUESTED" if "pdf" not in formats else
                        "FAILED" if pdf_error else "GENERATED"),
         "requested_formats": sorted(formats),
@@ -2846,6 +2923,8 @@ def main():
                         help="Maximum XML input size in MiB (default: 100; maximum: 2048)")
     parser.add_argument("--format", "--formats", dest="formats", default="all",
                         help="Report format(s): all (default), pdf, html, csv, json; comma-separated allowed, e.g. pdf,csv")
+    parser.add_argument("--combined-csv", action="store_true",
+                        help="Batch mode: also generate one combined-findings.csv with findings from all successfully scanned XML files; independent of --format")
     parser.add_argument("--recursive", action="store_true",
                         help="Include XML files in subdirectories (batch mode)")
     args = parser.parse_args()
@@ -2868,6 +2947,8 @@ def main():
     MAX_XML_BYTES = args.max_xml_mib * 1024 * 1024
     if bool(args.xml) == bool(args.input_dir):
         parser.error("Provide either a single XML file or --input-dir")
+    if args.combined_csv and not args.input_dir:
+        parser.error("--combined-csv requires --input-dir (batch mode)")
     try:
         baseline = load_baseline(args.baseline)
     except (OSError, ValueError) as exc:
@@ -2906,28 +2987,43 @@ def main():
         batch = base / (batch.name + "_" + secrets.token_hex(3))
     batch.mkdir(parents=True, mode=0o700)
     results = []
+    combined_file = None
+    combined_writer = None
+    combined_path = batch / "combined-findings.csv"
+    if args.combined_csv:
+        combined_file = open(combined_path, "w", newline="", encoding="utf-8-sig")
+        combined_writer = csv.DictWriter(
+            combined_file, fieldnames=["configuration", "scan_status", *csv_fields()],
+            extrasaction="ignore")
+        combined_writer.writeheader()
     for index, path in enumerate(files, 1):
         # Numbered names avoid collisions; strict mode never writes source names.
         safe_name = re.sub(r"[^A-Za-z0-9._-]", "_", path.stem)[:70].strip("._") or "config"
         dirname = f"{index:03d}_{safe_name}" if args.privacy == "standard" else f"{index:03d}_config"
         out = batch / dirname
         try:
-            result = scan_one(path, out, baseline, args.privacy, selected_formats)
+            result = scan_one(path, out, baseline, args.privacy, selected_formats, combined_writer)
         except Exception as exc:
             # Surface the real error without exposing XML content or credentials.
-            error_detail = f"{type(exc).__name__}: {exc}"
+            error_detail = (str(exc) if str(exc).startswith("EMPTY_FILE:")
+                            else f"{type(exc).__name__}: {exc}")
             print(f"[!] {path.name if args.privacy == 'standard' else f'config-{index:03d}'}: {error_detail}", file=sys.stderr)
             result = {
                 "configuration": path.name if args.privacy == "standard" else f"config-{index:03d}",
                 "status": "FAILED", "coverage_note": error_detail,
+                "error_code": "EMPTY_FILE" if error_detail.startswith("EMPTY_FILE:") else type(exc).__name__,
                 "findings": 0, "severity": {}, "output_folder": dirname}
         results.append(result)
         print(f"[{index}/{len(files)}] {result['configuration']}: "
               f"{result['status']} ({result['findings']} findings)")
 
+    if combined_file is not None:
+        combined_file.close()
+        chmod_private(combined_path)
     summary = {"scanner": "H4wkEye", "version": VERSION,
                "generated": datetime.now().isoformat(timespec="seconds"),
                "privacy_mode": args.privacy, "files": results,
+               "combined_csv": "combined-findings.csv" if args.combined_csv else None,
                "status_counts": dict(Counter(r["status"] for r in results))}
     summary_path = batch / "batch-summary.json"
     write_json(summary_path, summary)

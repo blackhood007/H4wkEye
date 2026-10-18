@@ -73,3 +73,26 @@ This package represents the **v3.0.9 policy-provenance engine with optional repo
 ## License
 
 Apache License 2.0. See `LICENSE`.
+
+## v3.0.10 configuration coverage diagnostics
+
+The scanner distinguishes actual policy entries from empty XML containers. For standalone exports, `H4wkEye-coverage.json` includes `configuration_coverage` with local policy counts, counts of known configuration paths, a `NO_LOCAL_RULES` marker, and `NOT_DETERMINED` effective-policy status. Counts are inventory only, **not vulnerability findings or proof of security assessment**. Panorama inheritance and pushed policy evaluation remain unsupported.
+
+Zero-byte XML files fail with `EMPTY_FILE`. Structural element names containing redaction-like text are counted as warnings without exposing their values; sanitize values and identifiers, never XML tag names. Batch `PARTIAL` results should not be interpreted as clean bills of health.
+
+### Combined findings CSV (batch mode)
+
+Use `--combined-csv` with `--input-dir` to generate one additional `combined-findings.csv` in the timestamped batch folder. It contains all findings from successfully scanned XML files, with `configuration` and `scan_status` columns identifying the source of each row. The combined CSV uses the same finding columns and privacy transformations as individual CSV reports. In `--privacy strict` mode, the configuration column uses a pseudonym rather than the original filename. Failed inputs contribute no findings; consult `batch-summary.json` for failures and coverage limitations. If no findings are produced, the CSV still contains a header row.
+
+```bash
+# Individual HTML reports plus a single combined findings CSV
+python3 h4wkeye.py --input-dir ./PA-Configs --output-dir ./reports --format html --combined-csv
+
+# Individual CSV reports and a consolidated CSV
+python3 h4wkeye.py --input-dir ./PA-Configs --output-dir ./reports --format csv --combined-csv
+
+# All four individual formats plus a consolidated CSV
+python3 h4wkeye.py --input-dir ./PA-Configs --output-dir ./reports --combined-csv
+```
+
+`--combined-csv` is optional and batch-only. It does not alter `--format` selections or replace `batch-summary.json` and coverage diagnostics. It combines **findings**, not complete HTML/PDF reports or per-device policy simulations. Treat the consolidated file as confidential assessment data.
