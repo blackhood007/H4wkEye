@@ -1,47 +1,75 @@
 # H4wkEye 🦅
 
-**Offline PAN-OS Configuration Security Scanner**
+**Offline PAN-OS / Panorama XML Configuration Security Scanner**
 
-H4wkEye performs static security assessment of PAN-OS XML configuration exports without sending the configuration or report data over the network.
+H4wkEye analyzes Palo Alto Networks configuration XML locally, without uploading configurations to external services. It supports standalone firewall and Panorama discovery, security configuration checks, and coverage diagnostics. **This is a static assessment, not an effective per-firewall policy simulation.**
 
-## Privacy model
+## Requirements
 
-- No telemetry, analytics, cloud APIs, DNS lookups, update checks, remote JavaScript/CSS, or other network functionality.
-- Credential-bearing XML values are redacted in memory immediately after parsing and before discovery/report generation.
-- `--privacy standard` keeps operational identifiers such as rule/object names and IP addresses in the local report.
-- `--privacy strict` pseudonymizes common operational identifiers while preserving relationships for review.
-- Generated reports are created with restrictive permissions (`0600`) where supported.
+- Python 3; install dependencies from `requirements.txt` for PDF output.
+- For Kali Linux, `sudo apt install python3-reportlab` may be preferable to system-wide `pip` installation.
+- Sufficient RAM and disk space for large exports; XML size limit and memory requirements are different.
 
-> Treat PAN-OS configuration exports and generated reports as sensitive security material.
+```bash
+python3 -m pip install -r requirements.txt
+python3 h4wkeye.py --help
+```
 
 ## Usage
 
 ```bash
-python3 h4wkeye.py firewall.xml --baseline baseline.json --output ./reports
-python3 h4wkeye.py firewall.xml --baseline baseline.json --privacy strict --output ./reports-safe
+# Single firewall: all four report formats (default)
+python3 h4wkeye.py firewall.xml --output ./reports
+
+# Only PDF; does not require generating HTML, CSV or report JSON
+python3 h4wkeye.py firewall.xml --output ./reports --format pdf
+
+# Only CSV or HTML
+python3 h4wkeye.py firewall.xml --output ./reports --format csv
+python3 h4wkeye.py firewall.xml --output ./reports --format html
+
+# Multiple selected formats
+python3 h4wkeye.py firewall.xml --output ./reports --format pdf,csv
+
+# All formats, explicitly
+python3 h4wkeye.py firewall.xml --output ./reports --format all
+
+# Batch scan; larger XML limit (500 MiB)
+python3 h4wkeye.py --input-dir ./PA-Configs --output-dir ./reports --max-xml-mib 500 --format html,pdf
+
+# Include XML files in subdirectories
+python3 h4wkeye.py --input-dir ./PA-Configs --recursive --output-dir ./reports --format json
+
+# Privacy and baseline options
+python3 h4wkeye.py firewall.xml --privacy strict --baseline baseline.json --format pdf
 ```
 
-## Supported assessment areas
+### `--format` / `--formats`
 
-Security rules, NAT/decryption discovery, site-to-site VPN correlation and crypto posture, GlobalProtect review, management plane checks, authentication/password profile review, network protection, address/group resolution, and configuration inventory.
+Accepts `pdf`, `html`, `csv`, `json`, `all`, or comma-separated combinations such as `pdf,csv`. Format names are case-insensitive. `all` is the default and cannot be combined with other values. Invalid formats cause a command-line error. The selected formats control the **main findings reports**; `H4wkEye-coverage.json` is always generated, and batch mode also writes `batch-summary.json`. If PDF is not requested, ReportLab is not needed for that scan. A requested PDF failure is recorded without discarding successfully generated reports.
 
-## Important limitation
+### `--max-xml-mib`
 
-H4wkEye is a static configuration assessment tool. It does not prove live exploitability, reachability, negotiated VPN state, external IdP/MFA behavior, dynamic address-group runtime membership, or business justification. Findings require assessor validation.
+Maximum accepted XML input size, in **MiB** (1 MiB = 1,048,576 bytes). Default **100 MiB**; permitted range **1–2048 MiB**. Example: `--max-xml-mib 500` allows XML files up to 500 MiB. This is a safety input-size limit, **not a memory allocation or guarantee of successful scanning**. Large XML files can consume significantly more RAM than their on-disk size. Raise this only for trusted configuration exports on appropriately resourced systems.
+
+## Outputs
+
+For a single XML input, reports are written under `--output`. For batch input, each configuration gets a numbered folder beneath a timestamped batch directory. Depending on selected formats, output includes `H4wkEye-report.pdf`, `.html`, `.csv`, and/or `.json`. `H4wkEye-coverage.json` is always produced. Batch runs also produce `batch-summary.json`, including requested/generated format metadata and PDF status (`GENERATED`, `FAILED`, or `NOT_REQUESTED`).
+
+## Assessment coverage and limitations
+
+Current development builds include security rule checks, NAT and decryption discovery, site-to-site VPN and GlobalProtect checks, management plane, authentication, logging/network protection, and address/service reference diagnostics. Panorama diagnostics inventory device groups, shared objects, templates, template stacks, and pre/post-rulebase policy provenance. Scope-aware lookups avoid unrelated device-group fallback, and reference accounting is tracked separately from vulnerability findings.
+
+**Important:** Panorama device-group inheritance, template overlays, firewall-local overrides, and effective per-device policy are **not fully resolved**. Panorama runs may correctly show `PARTIAL`. A finding is not proof of exploitability or business impact. Static exports cannot establish live reachability, dynamic address-group membership, negotiated VPN state, or external MFA/IdP enforcement. Unsupported or sanitized values can reduce assessment completeness. Validate contextual findings before reporting them as vulnerabilities.
+
+## Privacy and security
+
+No telemetry or network reporting is required. Sensitive values are redacted during scanning. `--privacy standard` retains some operational identifiers in local reports; `--privacy strict` pseudonymizes additional identifiers. Coverage diagnostics use generated scope identifiers, but **review every file before sharing**. Treat XML exports and generated reports as confidential security material. Generated report files use restrictive permissions where supported.
+
+## Development and contribution
+
+This package represents the **v3.0.9 policy-provenance engine with optional report formats**, a post-v3.0.9 development update. It is not yet a fully validated public v3.1.0 release. Test against synthetic standalone PAN-OS and Panorama configurations, as well as large exports, before publishing. Do not commit customer configurations, real credentials, or sensitive reports.
 
 ## License
 
-Apache License 2.0.
-
-
-## PDF reports
-
-H4wkEye generates HTML, PDF, CSV, and JSON reports from the same privacy-sanitized scan data.
-
-Install the PDF dependency:
-
-```bash
-python3 -m pip install -r requirements.txt
-```
-
-The PDF is generated fully offline and embeds the local H4wkEye logo. Secret values are redacted before analysis, and `--privacy strict` pseudonymization is applied before PDF generation.
+Apache License 2.0. See `LICENSE`.

@@ -25,7 +25,7 @@ from collections import Counter, defaultdict
 from datetime import datetime
 from pathlib import Path
 
-VERSION = "3.0.1"
+VERSION = "3.0.9"
 
 DEFAULT_BASELINE = {
     "weak_encryption": ["des", "3des"],
@@ -114,7 +114,7 @@ def safe_join(values):
     return str(values)
 
 
-MAX_XML_BYTES = 100 * 1024 * 1024
+MAX_XML_BYTES = 100 * 1024 * 1024  # Overridden by --max-xml-mib in main()
 REDACTED = "[REDACTED]"
 SENSITIVE_TAG_PARTS = (
     "password", "passwd", "passphrase", "pre-shared-key", "private-key",
@@ -242,6 +242,7 @@ class Scanner:
 
         self.addresses = defaultdict(dict)
         self.address_groups = defaultdict(dict)
+        self.resolution_statistics = Counter()
 
         self.security_rules = []
         self.decryption_rules = []
@@ -419,54 +420,37 @@ class Scanner:
                 self.inventory[f"Address groups: {kind}"] += 1
 
     def candidate_scopes(self, requested_scope):
-        # Exact scope first, then progressively broader/fallback scopes.
-        scopes = list(self.addresses.keys() | self.address_groups.keys())
-        ordered = []
+        """Only the current policy scope and Panorama shared objects are eligible.
 
-        if requested_scope:
-            ordered.append(requested_scope)
-
-            req_parts = requested_scope.split(" > ")
-            for scope in scopes:
-                if scope == requested_scope:
-                    continue
-                score = sum(1 for p in req_parts if p in scope)
-                if score:
-                    ordered.append((score, scope))
-
-        ordered.extend((0, s) for s in scopes if s != requested_scope)
-
-        normalized = []
-        for item in ordered:
-            if isinstance(item, tuple):
-                normalized.append(item)
-            else:
-                normalized.append((999, item))
-
-        normalized.sort(key=lambda x: (-x[0], x[1]))
-
-        result = []
-        for _, scope in normalized:
-            if scope not in result:
-                result.append(scope)
-        return result
+        No device-group parent inheritance is assumed. Device-local/vsys scopes
+        never borrow objects from unrelated device groups.
+        """
+        requested_scope = requested_scope or "device/local"
+        candidates = [requested_scope]
+        # In Panorama exports the shared subtree is identified by this exact key.
+        if requested_scope != "shared":
+            candidates.append("shared")
+        return candidates
 
     def lookup_address(self, name, scope):
-        exact = []
+        """Resolve in scope, then shared. Never guess across device groups.
+
+        Returns (object_tuple, ambiguous). A same-scope address/group collision
+        is explicitly ambiguous rather than silently selecting an arbitrary one.
+        """
         for candidate in self.candidate_scopes(scope):
+            matches = []
             if name in self.addresses.get(candidate, {}):
-                exact.append(("address", candidate, self.addresses[candidate][name]))
+                matches.append(("address", candidate, self.addresses[candidate][name]))
             if name in self.address_groups.get(candidate, {}):
-                exact.append(("group", candidate, self.address_groups[candidate][name]))
-
-            # Exact scope wins immediately.
-            if candidate == scope and exact:
-                return exact[0], False
-
-        if len(exact) == 1:
-            return exact[0], False
-        if len(exact) > 1:
-            return exact[0], True
+                matches.append(("group", candidate, self.address_groups[candidate][name]))
+            if len(matches) > 1:
+                self.resolution_statistics["ambiguous_same_scope"] += 1
+                return None, True
+            if matches:
+                self.resolution_statistics["resolved_local" if candidate == scope else "resolved_shared"] += 1
+                return matches[0], False
+        self.resolution_statistics["unresolved"] += 1
         return None, False
 
     def resolve_object(self, name, scope, stack=None):
@@ -489,11 +473,12 @@ class Scanner:
             return [name]
 
         if name in stack:
+            self.resolution_statistics["group_cycles"] += 1
             return [f"{name} [group-cycle]"]
 
         lookup, ambiguous = self.lookup_address(name, scope)
         if lookup is None:
-            return [f"{name} [unresolved]"]
+            return [f"{name} [ambiguous-scope]" if ambiguous else f"{name} [unresolved]"]
 
         kind, found_scope, obj = lookup
         suffix = " [ambiguous-scope]" if ambiguous else ""
@@ -540,6 +525,9 @@ class Scanner:
                 common = {
                     "name": name,
                     "scope": scope,
+                    "layer": next((n.tag for n in reversed(self.ancestry(entry))
+                                   if n.tag in ("pre-rulebase", "post-rulebase", "rulebase")), "unknown"),
+                    "layer_order": len(self.security_rules) if elem.tag == "security" else (len(self.nat_rules) if elem.tag == "nat" else len(self.decryption_rules)),
                     "from": members(entry, "./from"),
                     "to": members(entry, "./to"),
                     "source": members(entry, "./source"),
@@ -2006,7 +1994,7 @@ def write_pdf(path, data):
         from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
         from reportlab.lib.units import mm
         from reportlab.platypus import (
-            SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, PageBreak,
+            SimpleDocTemplate, Paragraph, Spacer, Table, LongTable, TableStyle, PageBreak,
             Image, KeepTogether, HRFlowable
         )
     except ImportError as exc:
@@ -2247,9 +2235,35 @@ def write_pdf(path, data):
                 ("Applications", x.get("applications")),
                 ("Services", x.get("services")),
             ]
-            context_rows = [[P(k,label), P(v,small)] for k,v in context_fields if v not in (None,"",[],{})]
+            # Keep each PDF table row shorter than a page. ReportLab cannot split
+            # a single oversized table cell across pages, even in LongTable.
+            # Preserve the full content; the JSON/HTML reports are unchanged.
+            context_rows = []
+            for k, v in context_fields:
+                if v in (None, "", [], {}):
+                    continue
+                if isinstance(v, (list, tuple, set)):
+                    parts = [str(item) for item in v]
+                else:
+                    parts = str(v).split(", ")
+                chunks = []
+                current = ""
+                for part in parts:
+                    # Bound both individual tokens and total paragraph length.
+                    tokens = [part[i:i+160] for i in range(0, len(part), 160)] or [""]
+                    for token in tokens:
+                        candidate = (current + ", " + token) if current else token
+                        if len(candidate) > 480 and current:
+                            chunks.append(current)
+                            current = token
+                        else:
+                            current = candidate
+                if current:
+                    chunks.append(current)
+                for i, chunk in enumerate(chunks):
+                    context_rows.append([P(k if i == 0 else f"{k} (cont.)", label), P(chunk, small)])
             if context_rows:
-                ct = Table(context_rows, colWidths=[35*mm,130*mm])
+                ct = LongTable(context_rows, colWidths=[35*mm,130*mm], splitByRow=1)
                 ct.setStyle(TableStyle([
                     ("GRID",(0,0),(-1,-1),0.25,palette["line"]),
                     ("BACKGROUND",(0,0),(0,-1),palette["panel"]),
@@ -2337,87 +2351,589 @@ def load_baseline(path):
     return baseline
 
 
+def detect_coverage(scanner):
+    """Conservative coverage signal, not a claim that a device is secure."""
+    root = scanner.root
+    tag = str(root.tag).split("}")[-1]
+    inventory = scanner.inventory
+    assessed = sum(inventory.get(k, 0) for k in (
+        "Security rules", "Decryption rules", "NAT rules", "IKE gateways",
+        "IPsec tunnels", "GlobalProtect portals", "GlobalProtect gateways",
+        "Interface management profiles", "Zone Protection profiles",
+        "Authentication profiles"))
+    panorama = bool(root.findall(".//device-group/entry") or
+                    root.findall(".//device-groups/entry") or
+                    root.findall(".//template/entry") or
+                    root.findall(".//template-stack/entry"))
+    # These structures are meaningful even when no current detector evaluates them.
+    policy_containers = sum(1 for e in root.iter()
+                            if e.tag in ("pre-rulebase", "post-rulebase", "rulebase"))
+    if tag not in ("config", "response"):
+        return "PARTIAL", "Unrecognized XML root; assessment coverage not verified"
+    if assessed == 0:
+        return "PARTIAL", "No supported assessable objects discovered; zero findings are inconclusive"
+    if panorama:
+        return "PARTIAL", "Panorama detected; template inheritance and effective policy are not fully resolved"
+    if policy_containers and inventory.get("Security rules", 0) == 0:
+        return "PARTIAL", "Policy containers detected but no security rules parsed"
+    return "COMPLETED", "Supported configuration sections assessed; not a security certification"
+
+
+def panorama_diagnostics(scanner):
+    """Inventory policy scope and hierarchy; never claim effective-policy resolution."""
+    root = scanner.root
+    scopes = Counter()
+    raw = Counter()
+    for node in root.iter():
+        if node.tag not in ("security", "nat", "decryption"):
+            continue
+        rules = node.find("./rules")
+        if rules is None:
+            continue
+        for entry in rules.findall("./entry"):
+            ancestry = scanner.ancestry(entry)
+            layer = next((n.tag for n in reversed(ancestry)
+                          if n.tag in ("pre-rulebase", "post-rulebase", "rulebase")), "other")
+            scope = scanner.scope(entry)
+            raw[node.tag] += 1
+            scopes[(node.tag, layer, scope)] += 1
+
+    parsed = {"security": len(scanner.security_rules),
+              "nat": len(scanner.nat_rules),
+              "decryption": len(scanner.decryption_rules)}
+    group_entries = root.findall("./devices/entry/device-group/entry")
+    group_entries += root.findall("./device-group/entry")
+    groups = []
+    for e in group_entries:
+        groups.append({"name": e.get("name", ""),
+                       "parent": text_of(e, "./parent-dg") or None,
+                       "devices": len(e.findall("./devices/entry"))})
+    group_names = {g["name"] for g in groups}
+    missing_parents = sorted({g["parent"] for g in groups
+                              if g["parent"] and g["parent"] not in group_names})
+    templates = root.findall("./devices/entry/template/entry")
+    templates += root.findall("./template/entry")
+    stacks = root.findall("./devices/entry/template-stack/entry")
+    stacks += root.findall("./template-stack/entry")
+    stack_info = [{"name": e.get("name", ""),
+                   "templates": members(e, "./templates"),
+                   "devices": len(e.findall("./devices/entry"))} for e in stacks]
+    return {
+        "method": "raw XML scope inventory; NOT effective-policy evaluation",
+        "raw_policy_entries": dict(raw),
+        "scanner_parsed_entries": parsed,
+        "policy_count_mismatch": {k: {"xml": raw[k], "parsed": parsed[k]}
+                                  for k in parsed if raw[k] != parsed[k]},
+        "policy_scopes": [{"type": kind, "layer": layer, "scope": scope, "count": count}
+                          for (kind, layer, scope), count in sorted(scopes.items())],
+        "device_groups": groups,
+        "missing_parent_device_groups": missing_parents,
+        "templates": [e.get("name", "") for e in templates],
+        "template_stacks": stack_info,
+        "limitations": [
+            "Parent device-group rules and shared objects are not merged into an effective per-device rulebase.",
+            "Template and template-stack settings are inventoried, not overlaid with device-local settings.",
+            "Object lookup may fall back to unrelated scopes; contextual rule findings need validation.",
+            "Local firewall overrides and runtime state may be absent from the Panorama export.",
+            "Counts represent XML entries and may include repeated or non-effective rules."
+        ],
+    }
+
+
+
+def privacy_safe_panorama_diagnostics(diagnostics):
+    """Export stable-in-report aliases without exposing internal object names.
+
+    Do not infer relationships when source names are ambiguous or redacted.
+    """
+    from collections import Counter as _Counter
+    import re
+
+    groups = diagnostics.get("device_groups", [])
+    templates = diagnostics.get("templates", [])
+    stacks = diagnostics.get("template_stacks", [])
+    scopes = diagnostics.get("policy_scopes", [])
+
+    def mapping(values, prefix):
+        return {name: f"{prefix}-{i:03d}" for i, name in enumerate(
+            sorted({v for v in values if isinstance(v, str) and v}), 1)}
+
+    gm = mapping([g.get("name") for g in groups], "DG")
+    tm = mapping(templates + [t for st in stacks for t in st.get("templates", [])], "TPL")
+    sm = mapping([st.get("name") for st in stacks], "STACK")
+    name_counts = _Counter(g.get("name") for g in groups)
+    stack_counts = _Counter(st.get("name") for st in stacks)
+
+    # Scope is an internal representation, not an effective-policy locator.
+    # Replace each path component, preserving repeated identifiers consistently.
+    other_scopes = mapping([part for sc in scopes for part in sc.get("scope", "").split(" > ")
+                            if not part.startswith("device-group:")], "SCOPE")
+    def safe_scope(scope):
+        result = []
+        for part in scope.split(" > "):
+            if part.startswith("device-group:"):
+                raw = part[len("device-group:"):]
+                result.append("device-group:" + gm.get(raw, "UNRESOLVED-DG"))
+            else:
+                result.append(other_scopes.get(part, "UNRESOLVED-SCOPE"))
+        return " > ".join(result)
+
+    safe = {k: v for k, v in diagnostics.items() if k not in (
+        "policy_scopes", "device_groups", "templates", "template_stacks",
+        "missing_parent_device_groups")}
+    safe["privacy"] = {
+        "mode": "consistent per-report aliases; mapping is not exported",
+        "warning": "If input names were already replaced with the same redaction string, original identities and relationships cannot be recovered",
+        "duplicate_device_group_names": sum(n-1 for n in name_counts.values() if n > 1),
+        "duplicate_template_stack_names": sum(n-1 for n in stack_counts.values() if n > 1),
+        "unmatched_policy_scope_groups": sum(
+            1 for sc in scopes if any(part.startswith("device-group:") and
+                part[len("device-group:"):] not in gm for part in sc.get("scope", "").split(" > "))),
+    }
+    safe["device_groups"] = [{"id": gm.get(g.get("name"), "UNRESOLVED-DG"),
+        "parent_id": gm.get(g.get("parent"), "UNRESOLVED-DG") if g.get("parent") else None,
+        "devices": g.get("devices", 0)} for g in groups]
+    safe["missing_parent_device_groups"] = [gm.get(n, "UNRESOLVED-DG") for n in
+                                              diagnostics.get("missing_parent_device_groups", [])]
+    safe["templates"] = [tm.get(t, "UNRESOLVED-TPL") for t in templates]
+    safe["template_stacks"] = [{"id": sm.get(st.get("name"), "UNRESOLVED-STACK"),
+        "templates": [tm.get(t, "UNRESOLVED-TPL") for t in st.get("templates", [])],
+        "devices": st.get("devices", 0)} for st in stacks]
+    safe["policy_scopes"] = [{**sc, "scope": safe_scope(sc.get("scope", ""))} for sc in scopes]
+    safe["identity_quality"] = {
+        "device_group_records": len(groups),
+        "unique_device_group_names": len(gm),
+        "template_stack_records": len(stacks),
+        "unique_template_stack_names": len(sm),
+        "device_group_parent_links": sum(bool(g.get("parent")) for g in groups),
+        "warning": "Name collisions prevent reliable inheritance resolution" if
+                   any(n > 1 for n in name_counts.values()) or any(n > 1 for n in stack_counts.values()) else None,
+    }
+    return safe
+
+
+
+def audit_policy_references(scanner):
+    """Portable, read-only audit for PAN-OS firewall and Panorama XML.
+
+    Each reference visit has exactly one primary outcome. Nested references
+    are attributed to the originating policy type, avoiding v3.0.6's
+    top-level-only accounting discrepancy.
+    """
+    import ipaddress
+    from collections import Counter, defaultdict
+
+    root = scanner.root
+    index = defaultdict(lambda: defaultdict(dict))
+    kinds = ("address", "address-group", "service", "service-group")
+    containers = [("shared", root.find("./shared"))]
+    for path in ("./devices/entry/device-group/entry", "./device-group/entry",
+                 "./devices/entry/vsys/entry", "./vsys/entry"):
+        containers.extend((scanner.scope(node), node) for node in root.findall(path))
+    duplicate_definitions = 0
+    for scope, container in containers:
+        if container is None:
+            continue
+        for kind in kinds:
+            for node in container.findall(f"./{kind}/entry"):
+                name = node.get("name")
+                if not name:
+                    continue
+                if name in index[scope][kind]:
+                    duplicate_definitions += 1
+                index[scope][kind][name] = node
+
+    totals = Counter()
+    by_type = defaultdict(Counter)
+    by_family = defaultdict(Counter)
+    by_depth = Counter()
+    unresolved_unique = set()
+    outcomes = ("builtin", "literal", "resolved_local", "resolved_shared",
+                "unresolved", "ambiguous", "cycle", "dynamic_group", "unsupported_group")
+
+    def visit(name, scope, family, policy_type, stack=frozenset(), depth=0):
+        counter = by_type[policy_type]
+        family_counter = by_family[family]
+        totals["reference_visits"] += 1
+        counter["reference_visits"] += 1
+        family_counter["reference_visits"] += 1
+        by_depth[str(min(depth, 20))] += 1
+
+        def mark(outcome):
+            totals[outcome] += 1
+            counter[outcome] += 1
+            family_counter[outcome] += 1
+            return outcome
+
+        if not isinstance(name, str) or not name.strip():
+            unresolved_unique.add((scope, family, str(name)))
+            return mark("unresolved")
+        name = name.strip()
+        if name.lower() in ("any", "application-default"):
+            return mark("builtin")
+        if family == "address":
+            try:
+                ipaddress.ip_network(name, strict=False)
+                return mark("literal")
+            except ValueError:
+                pass
+        object_types = (("address", "address-group") if family == "address"
+                        else ("service", "service-group"))
+        for candidate in ([scope] if scope == "shared" else [scope, "shared"]):
+            hits = [(kind, index[candidate][kind][name]) for kind in object_types
+                    if name in index[candidate][kind]]
+            if len(hits) > 1:
+                return mark("ambiguous")
+            if not hits:
+                continue
+            kind, node = hits[0]
+            if kind.endswith("-group"):
+                identity = (candidate, kind, name)
+                if identity in stack:
+                    return mark("cycle")
+                if node.find("./dynamic") is not None:
+                    return mark("dynamic_group")
+                child_path = "./static" if family == "address" else "./members"
+                children = members(node, child_path)
+                if not children:
+                    return mark("unsupported_group")
+                # The group reference itself is resolved; nested failures are
+                # separately counted and never hidden by the parent outcome.
+                result = mark("resolved_local" if candidate == scope else "resolved_shared")
+                for child in children:
+                    visit(child, scope, family, policy_type,
+                          stack | {identity}, depth + 1)
+                return result
+            return mark("resolved_local" if candidate == scope else "resolved_shared")
+        unresolved_unique.add((scope, family, name))
+        return mark("unresolved")
+
+    for policy_type, rules in (("security", scanner.security_rules),
+                               ("nat", scanner.nat_rules),
+                               ("decryption", scanner.decryption_rules)):
+        for rule in rules:
+            totals["policies_audited"] += 1
+            by_type[policy_type]["policies"] += 1
+            for field, family in (("source", "address"),
+                                  ("destination", "address"),
+                                  ("service", "service")):
+                for name in rule.get(field, []):
+                    totals[f"top_level_{family}_references"] += 1
+                    by_type[policy_type]["top_level_references"] += 1
+                    visit(name, rule.get("scope", "device/local"), family, policy_type)
+
+    totals["duplicate_object_definitions"] = duplicate_definitions
+    totals["unique_unresolved_scope_family_name"] = len(unresolved_unique)
+    accounted = sum(totals[o] for o in outcomes)
+    totals["outcome_accounting_difference"] = totals["reference_visits"] - accounted
+    totals["policy_type_visit_difference"] = (totals["reference_visits"] -
+                                              sum(c["reference_visits"] for c in by_type.values()))
+    return {
+        "method": "generic offline XML reference audit; no effective-policy claim",
+        "lookup_order": "exact scope then shared; never unrelated device groups",
+        "counts": dict(sorted(totals.items())),
+        "policy_types": {k: dict(sorted(v.items())) for k, v in sorted(by_type.items())},
+        "reference_families": {k: dict(sorted(v.items())) for k, v in sorted(by_family.items())},
+        "nesting_depth_visits": dict(sorted(by_depth.items(), key=lambda p: int(p[0]))),
+        "accounting_valid": (totals["outcome_accounting_difference"] == 0 and
+                             totals["policy_type_visit_difference"] == 0),
+        "limitations": [
+            "Reference visits are not unique objects or unique policy rules.",
+            "Only source, destination and service fields are audited.",
+            "Dynamic groups cannot be expanded without runtime context.",
+            "No effective per-firewall policy, local override, or template-stack overlay.",
+            "Unresolved references may reflect sanitized or incomplete XML.",
+            "Unique unresolved identifiers are counted but never exported.",
+        ],
+    }
+
+
+
+
+def normalized_configuration_diagnostics(scanner):
+    """Privacy-safe, generic configuration-model inventory (not effective policy).
+
+    Normalizes scope identity and rule provenance without exporting original
+    names, addresses, hostnames, or rule identifiers. This is intentionally
+    independent from the existing detection engine.
+    """
+    from collections import Counter, defaultdict
+
+    root = scanner.root
+    scope_ids = {}
+    scope_types = {}
+    scope_counters = Counter()
+    object_counts = Counter()
+    policy_counts = Counter()
+    rule_layers = Counter()
+    rule_layers_by_type = defaultdict(Counter)
+    rule_layers_by_scope = defaultdict(Counter)
+    missing_scopes = Counter()
+    policy_samples = []
+
+    def normalize_scope(raw):
+        raw = str(raw or 'device/local')
+        segments = [x.strip() for x in raw.split(' > ') if x.strip()]
+        # Specific scope type takes precedence over the enclosing device.
+        typ = 'local'
+        for prefix, target in (('device-group:', 'device_group'),
+                               ('vsys:', 'vsys'),
+                               ('template-stack:', 'template_stack'),
+                               ('template:', 'template')):
+            if any(seg.startswith(prefix) for seg in segments):
+                typ = target
+                break
+        else:
+            if 'shared' in segments:
+                typ = 'shared'
+            elif any(seg.startswith('device:') for seg in segments):
+                typ = 'device'
+        if raw not in scope_ids:
+            scope_counters[typ] += 1
+            scope_ids[raw] = f'{typ.upper()}-{scope_counters[typ]:04d}'
+            scope_types[raw] = typ
+        return scope_ids[raw], typ
+
+    # Index only explicit object definitions in supported local/shared scopes.
+    containers = [('shared', root.find('./shared'))]
+    for path in ('./devices/entry/device-group/entry', './device-group/entry',
+                 './devices/entry/vsys/entry', './vsys/entry'):
+        containers.extend((scanner.scope(e), e) for e in root.findall(path))
+    for raw_scope, container in containers:
+        if container is None:
+            continue
+        sid, typ = normalize_scope(raw_scope)
+        for kind in ('address', 'address-group', 'service', 'service-group'):
+            n = len(container.findall(f'./{kind}/entry'))
+            object_counts[kind] += n
+            if n:
+                object_counts[f'{typ}:{kind}'] += n
+
+    # Build a provenance inventory, not a second copy of the policy engine.
+    for kind, rules in (('security', scanner.security_rules),
+                        ('nat', scanner.nat_rules),
+                        ('decryption', scanner.decryption_rules)):
+        for rule in rules:
+            raw_scope = rule.get('scope', 'device/local')
+            sid, typ = normalize_scope(raw_scope)
+            policy_counts[kind] += 1
+            policy_counts[f'{typ}:{kind}'] += 1
+            # Rule dictionaries vary across PAN-OS versions and adapters.
+            # Missing layer is explicitly recorded rather than guessed.
+            layer = str(rule.get('layer') or rule.get('rulebase') or 'unknown')
+            if layer not in ('pre-rulebase', 'post-rulebase', 'rulebase'):
+                layer = 'unknown'
+            rule_layers[layer] += 1
+            rule_layers_by_type[kind][layer] += 1
+            rule_layers_by_scope[sid][layer] += 1
+            if len(policy_samples) < 8:
+                policy_samples.append({'type': kind, 'scope_id': sid, 'scope_type': typ,
+                                       'layer': layer})
+
+    # Detect policy scopes that are not backed by an explicit object container.
+    container_scope_set = {raw for raw, node in containers if node is not None}
+    for kind, rules in (('security', scanner.security_rules),
+                        ('nat', scanner.nat_rules),
+                        ('decryption', scanner.decryption_rules)):
+        for rule in rules:
+            raw_scope = str(rule.get('scope', 'device/local'))
+            if raw_scope not in container_scope_set:
+                missing_scopes[kind] += 1
+
+    return {
+        'schema_version': '1.0',
+        'model': 'normalized diagnostic inventory; not effective policy',
+        'source_type': ('panorama' if root.findall('.//device-group/entry') or
+                        root.findall('.//template-stack/entry') else 'standalone_or_other'),
+        'scope_counts': dict(sorted(Counter(scope_types.values()).items())),
+        'object_counts': dict(sorted(object_counts.items())),
+        'policy_counts': dict(sorted(policy_counts.items())),
+        'rule_layers': dict(sorted(rule_layers.items())),
+        'rule_layers_by_type': {k: dict(sorted(v.items())) for k, v in sorted(rule_layers_by_type.items())},
+        'rule_layers_by_scope': {k: dict(sorted(v.items())) for k, v in sorted(rule_layers_by_scope.items())},
+        'layer_accounting_valid': (sum(rule_layers.values()) == sum(policy_counts[k] for k in ('security', 'nat', 'decryption')) and all(sum(v.values()) == policy_counts[k] for k, v in rule_layers_by_type.items())),
+        'policy_scopes_without_object_container': dict(sorted(missing_scopes.items())),
+        'policy_samples': policy_samples,
+        'privacy': 'generated scope IDs only; original identifiers omitted',
+        'limitations': [
+            'Scope identifiers are diagnostic and are not stable across different input exports.',
+            'Unknown policy layer is reported when XML lacks a recognized rulebase ancestor.',
+            'Object inventory does not expand nested groups or compute effective policy.',
+            'A policy scope without an object container is not necessarily invalid.',
+            'No inheritance, template overlays, or runtime evaluation is claimed.'
+        ],
+    }
+
+def scan_one(xml_path, out, baseline, privacy, formats=None):
+    formats = set(formats or ("html", "pdf", "csv", "json"))
+    scanner = Scanner(xml_path, baseline)
+    scanner.run()
+    status, coverage_note = detect_coverage(scanner)
+    data = scanner.output_data()
+    diagnostics = panorama_diagnostics(scanner)
+    data["metadata"]["scan_status"] = status
+    data["metadata"]["coverage_note"] = coverage_note
+    data = apply_privacy(data, privacy, secrets.token_hex(16))
+    out.mkdir(parents=True, exist_ok=True, mode=0o700)
+    outputs = {
+        "json": out / "H4wkEye-report.json",
+        "csv": out / "H4wkEye-report.csv",
+        "html": out / "H4wkEye-report.html",
+        "pdf": out / "H4wkEye-report.pdf",
+    }
+    # A separate diagnostic artifact avoids silently treating raw inventory as resolved policy.
+    diagnostic_path = out / "H4wkEye-coverage.json"
+    # Always pseudonymize the coverage diagnostic, including in standard mode.
+    # Strict mode still omits detailed topology.
+    diagnostic_export = privacy_safe_panorama_diagnostics(diagnostics)
+    diagnostic_export["reference_audit"] = audit_policy_references(scanner)
+    diagnostic_export["normalized_model"] = normalized_configuration_diagnostics(scanner)
+    diagnostic_export["address_resolution"] = {
+        "strategy": "exact-policy-scope-then-shared; no unrelated device-group fallback",
+        "counts": dict(scanner.resolution_statistics),
+        "note": "Counts are lookup events during existing finding evaluations, not a full-policy reference audit.",
+    }
+    if privacy == "strict":
+        diagnostic_export = {k: v for k, v in diagnostic_export.items()
+                             if k not in ("policy_scopes", "device_groups", "templates", "template_stacks")}
+    write_json(diagnostic_path, diagnostic_export)
+    chmod_private(diagnostic_path)
+    if "json" in formats:
+        write_json(outputs["json"], data)
+    if "csv" in formats:
+        write_csv(outputs["csv"], data["findings"])
+    if "html" in formats:
+        write_html(outputs["html"], data)
+    pdf_error = None
+    if "pdf" in formats:
+        try:
+            write_pdf(outputs["pdf"], data)
+        except Exception as exc:
+            # PDF failures must not discard other reports or scan findings.
+            pdf_error = f"{type(exc).__name__}: {str(exc)[:400]}"
+            outputs["pdf"].unlink(missing_ok=True)
+            print(f"[!] PDF report unavailable for {xml_path.name}: {pdf_error}", file=sys.stderr)
+    for path in outputs.values():
+        if path.exists():
+            chmod_private(path)
+    return {
+        "configuration": xml_path.name if privacy == "standard" else
+                         hashlib.sha256(xml_path.name.encode()).hexdigest()[:12],
+        "status": status,
+        "coverage_note": coverage_note,
+        "pdf_status": ("NOT_REQUESTED" if "pdf" not in formats else
+                       "FAILED" if pdf_error else "GENERATED"),
+        "requested_formats": sorted(formats),
+        "generated_formats": sorted(k for k, p in outputs.items() if p.exists()),
+        "coverage_diagnostics": "H4wkEye-coverage.json",
+        "policy_count_mismatch": diagnostics["policy_count_mismatch"],
+        "pdf_error": pdf_error,
+        "findings": len(data["findings"]),
+        "severity": dict(Counter(f["severity"] for f in data["findings"])),
+        "output_folder": out.name if privacy == "standard" else "pseudonymized",
+    }
+
+
 def main():
     parser = argparse.ArgumentParser(
-        description="H4wkEye - offline PAN-OS XML security configuration scanner"
-    )
-    parser.add_argument("xml", help="PAN-OS XML configuration backup")
-    parser.add_argument(
-        "--output", default=".", help="Output directory (default: current directory)"
-    )
-    parser.add_argument(
-        "--baseline", help="Optional JSON baseline override"
-    )
-    parser.add_argument(
-        "--privacy", choices=("standard", "strict"), default="standard",
-        help="Report privacy mode. standard keeps operational identifiers; strict pseudonymizes them. Secrets are always redacted."
-    )
+        description="H4wkEye - offline PAN-OS XML configuration scanner")
+    parser.add_argument("xml", nargs="?", help="Single PAN-OS XML configuration")
+    parser.add_argument("--input-dir", help="Folder containing XML configurations")
+    parser.add_argument("--output", "--output-dir", dest="output", default=None)
+    parser.add_argument("--baseline", help="Optional JSON baseline override")
+    parser.add_argument("--privacy", choices=("standard", "strict"), default="standard")
+    parser.add_argument("--max-xml-mib", type=int, default=100,
+                        help="Maximum XML input size in MiB (default: 100; maximum: 2048)")
+    parser.add_argument("--format", "--formats", dest="formats", default="all",
+                        help="Report format(s): all (default), pdf, html, csv, json; comma-separated allowed, e.g. pdf,csv")
+    parser.add_argument("--recursive", action="store_true",
+                        help="Include XML files in subdirectories (batch mode)")
     args = parser.parse_args()
-
-    xml_path = Path(args.xml)
-    if not xml_path.is_file():
-        print(f"[!] Configuration not found: {xml_path}", file=sys.stderr)
-        return 2
-
-    out = Path(args.output)
-    out.mkdir(parents=True, exist_ok=True)
-
+    supported = {"pdf", "html", "csv", "json"}
+    selected = [item.strip().lower() for item in args.formats.split(",")]
+    if not selected or any(not item for item in selected):
+        parser.error("--format requires one or more formats: pdf,html,csv,json,all")
+    if "all" in selected:
+        if len(selected) != 1:
+            parser.error("'all' cannot be combined with individual formats")
+        selected_formats = supported
+    else:
+        invalid = set(selected) - supported
+        if invalid:
+            parser.error("Unsupported report format(s): " + ", ".join(sorted(invalid)))
+        selected_formats = set(selected)
+    if not 1 <= args.max_xml_mib <= 2048:
+        parser.error("--max-xml-mib must be between 1 and 2048")
+    global MAX_XML_BYTES
+    MAX_XML_BYTES = args.max_xml_mib * 1024 * 1024
+    if bool(args.xml) == bool(args.input_dir):
+        parser.error("Provide either a single XML file or --input-dir")
     try:
         baseline = load_baseline(args.baseline)
-        scanner = Scanner(xml_path, baseline)
-        scanner.run()
-        data = scanner.output_data()
-        privacy_salt = secrets.token_hex(16)
-        data = apply_privacy(data, args.privacy, privacy_salt)
-    except ET.ParseError as exc:
-        print(f"[!] Invalid XML: {exc}", file=sys.stderr)
-        return 3
-    except Exception as exc:
-        print(f"[!] Scanner error: {type(exc).__name__}: {exc}", file=sys.stderr)
-        return 4
+    except (OSError, ValueError) as exc:
+        print(f"[!] Baseline error: {exc}", file=sys.stderr)
+        return 2
 
-    json_path = out / "H4wkEye-report.json"
-    csv_path = out / "H4wkEye-report.csv"
-    html_path = out / "H4wkEye-report.html"
-    pdf_path = out / "H4wkEye-report.pdf"
+    if args.xml:
+        path = Path(args.xml)
+        if not path.is_file():
+            print(f"[!] Configuration not found: {path}", file=sys.stderr)
+            return 2
+        out = Path(args.output or ".")
+        try:
+            result = scan_one(path, out, baseline, args.privacy, selected_formats)
+        except Exception as exc:
+            print(f"[!] Scan failed: {type(exc).__name__}: {exc}", file=sys.stderr)
+            return 4
+        print(f"H4wkEye v{VERSION} | {result['status']} | "
+              f"findings={result['findings']} | {result['coverage_note']}")
+        print(f"Reports: {out.resolve()}")
+        return 0
 
-    write_json(json_path, data)
-    write_csv(csv_path, data["findings"])
-    write_html(html_path, data)
-    try:
-        write_pdf(pdf_path, data)
-    except RuntimeError as exc:
-        print(f"[!] PDF generation failed: {exc}", file=sys.stderr)
-        return 5
-    for report_path in (json_path, csv_path, html_path, pdf_path):
-        chmod_private(report_path)
+    folder = Path(args.input_dir)
+    if not folder.is_dir():
+        print(f"[!] Input folder not found: {folder}", file=sys.stderr)
+        return 2
+    files = sorted(folder.rglob("*.xml") if args.recursive else folder.glob("*.xml"))
+    files = [p for p in files if p.is_file() and not p.is_symlink()]
+    if not files:
+        print("[!] No XML files found", file=sys.stderr)
+        return 2
 
-    counts = Counter(f["severity"] for f in data["findings"])
+    base = Path(args.output or "./reports")
+    batch = base / datetime.now().strftime("%Y-%m-%d_%H%M%S")
+    if batch.exists():
+        batch = base / (batch.name + "_" + secrets.token_hex(3))
+    batch.mkdir(parents=True, mode=0o700)
+    results = []
+    for index, path in enumerate(files, 1):
+        # Numbered names avoid collisions; strict mode never writes source names.
+        safe_name = re.sub(r"[^A-Za-z0-9._-]", "_", path.stem)[:70].strip("._") or "config"
+        dirname = f"{index:03d}_{safe_name}" if args.privacy == "standard" else f"{index:03d}_config"
+        out = batch / dirname
+        try:
+            result = scan_one(path, out, baseline, args.privacy, selected_formats)
+        except Exception as exc:
+            # Surface the real error without exposing XML content or credentials.
+            error_detail = f"{type(exc).__name__}: {exc}"
+            print(f"[!] {path.name if args.privacy == 'standard' else f'config-{index:03d}'}: {error_detail}", file=sys.stderr)
+            result = {
+                "configuration": path.name if args.privacy == "standard" else f"config-{index:03d}",
+                "status": "FAILED", "coverage_note": error_detail,
+                "findings": 0, "severity": {}, "output_folder": dirname}
+        results.append(result)
+        print(f"[{index}/{len(files)}] {result['configuration']}: "
+              f"{result['status']} ({result['findings']} findings)")
 
-    print("=" * 72)
-    print(f"H4wkEye v{VERSION} - Offline PAN-OS Configuration Security Scanner")
-    print("=" * 72)
-    print(f"Configuration : {xml_path.name}")
-    print(f"Privacy mode  : {args.privacy}")
-    print(f"Secrets       : redacted before analysis ({data['metadata'].get('secret_values_redacted', 0)} values)")
-    print("Network       : no network functionality")
-    print(f"Findings      : {len(data['findings'])}")
-    print(
-        "Severity      : "
-        f"Critical={counts['CRITICAL']} "
-        f"High={counts['HIGH']} "
-        f"Medium={counts['MEDIUM']} "
-        f"Low={counts['LOW']} "
-        f"Info={counts['INFO']}"
-    )
-    print(f"IPsec tunnels : {len(data['vpn_inventory'])}")
-    print(f"HTML report   : {html_path}")
-    print(f"PDF report    : {pdf_path}")
-    print(f"CSV report    : {csv_path}")
-    print(f"JSON report   : {json_path}")
-    print("=" * 72)
-
-    return 0
+    summary = {"scanner": "H4wkEye", "version": VERSION,
+               "generated": datetime.now().isoformat(timespec="seconds"),
+               "privacy_mode": args.privacy, "files": results,
+               "status_counts": dict(Counter(r["status"] for r in results))}
+    summary_path = batch / "batch-summary.json"
+    write_json(summary_path, summary)
+    chmod_private(summary_path)
+    print(f"Batch reports: {batch.resolve()}")
+    return 1 if any(r["status"] == "FAILED" for r in results) else 0
 
 
 if __name__ == "__main__":
