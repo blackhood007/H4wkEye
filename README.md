@@ -42,6 +42,9 @@ python3 h4wkeye.py --input-dir ./PA-Configs --recursive --output-dir ./reports -
 
 # Privacy and baseline options
 python3 h4wkeye.py firewall.xml --privacy strict --baseline baseline.json --format pdf
+
+# Disable report finding consolidation when one row/card per original detection is preferred
+python3 h4wkeye.py firewall.xml --no-group-findings --format all
 ```
 
 ### `--format` / `--formats`
@@ -54,7 +57,20 @@ Maximum accepted XML input size, in **MiB** (1 MiB = 1,048,576 bytes). Default *
 
 ## Outputs
 
-For a single XML input, reports are written under `--output`. For batch input, each configuration gets a numbered folder beneath a timestamped batch directory. Depending on selected formats, output includes `H4wkEye-report.pdf`, `.html`, `.csv`, and/or `.json`. `H4wkEye-coverage.json` is always produced. Batch runs also produce `batch-summary.json`, including requested/generated format metadata and PDF status (`GENERATED`, `FAILED`, or `NOT_REQUESTED`).
+For a single XML input, reports are written under `--output`. For batch input, each configuration gets a numbered folder beneath a timestamped batch directory. Depending on selected formats, output includes `H4wkEye-report.pdf`, `.html`, `.csv`, and/or `.json`. CSV format creates a grouped `H4wkEye-report.csv` summary and `H4wkEye-evidence.csv` with one row per original detection. `H4wkEye-coverage.json` is always produced. Batch runs also produce `batch-summary.json`, including requested/generated format metadata and PDF status (`GENERATED`, `FAILED`, or `NOT_REQUESTED`).
+
+### Preview 8: consolidated findings and complete evidence
+
+By default, compatible rule-level detections in Firewall Rules, NAT Rules and Decryption Rules are grouped into concise findings when their detection meaning, severity, confidence, status, scope, description, remediation and risk score match. Each group's affected-rule evidence retains individual rule/object names, scope, source/destination zones and object/IP values, applications, services, status, confidence and evidence. Non-rule findings remain separate to avoid merging unrelated VPN, management-plane or platform issues. This is report-layer consolidation; the underlying detection logic is unchanged.
+
+- **PDF:** Landscape layout; each grouped finding is fully expanded, with a complete affected-rule table and repeating headers. No expand/collapse controls or hidden technical evidence. Large evidence sets continue across pages.
+- **HTML:** Grouped finding cards with the complete per-rule technical evidence available in the technical-context section.
+- **CSV:** `H4wkEye-report.csv` is the consolidated summary; `H4wkEye-evidence.csv` preserves one row per original detection.
+- **JSON:** `findings` contains consolidated groups with nested `affected_rules` and original finding IDs.
+- **Un-grouped view:** pass `--no-group-findings` to preserve one report entry per original detection.
+- **Batch mode:** `combined-findings.csv` contains grouped summaries; `combined-evidence.csv` contains per-detection evidence rows.
+
+Grouping does not mean that every rule is exploitable or effective. It reduces repeated prose while preserving the technical details for assessor review.
 
 ## Assessment coverage and limitations
 
@@ -82,7 +98,7 @@ Zero-byte XML files fail with `EMPTY_FILE`. Structural element names containing 
 
 ### Combined findings CSV (batch mode)
 
-Use `--combined-csv` with `--input-dir` to generate one additional `combined-findings.csv` in the timestamped batch folder. It contains all findings from successfully scanned XML files, with `configuration` and `scan_status` columns identifying the source of each row. The combined CSV uses the same finding columns and privacy transformations as individual CSV reports. In `--privacy strict` mode, the configuration column uses a pseudonym rather than the original filename. Failed inputs contribute no findings; consult `batch-summary.json` for failures and coverage limitations. If no findings are produced, the CSV still contains a header row.
+Use `--combined-csv` with `--input-dir` to generate `combined-findings.csv` (grouped summary) and `combined-evidence.csv` (one row per original detection) in the timestamped batch folder. Both include `configuration` and `scan_status` columns. In `--privacy strict` mode, the configuration column uses a pseudonym rather than the original filename. Failed inputs contribute no findings; consult `batch-summary.json` for failures and coverage limitations. Empty outputs retain header rows.
 
 ```bash
 # Individual HTML reports plus a single combined findings CSV
@@ -96,3 +112,60 @@ python3 h4wkeye.py --input-dir ./PA-Configs --output-dir ./reports --combined-cs
 ```
 
 `--combined-csv` is optional and batch-only. It does not alter `--format` selections or replace `batch-summary.json` and coverage diagnostics. It combines **findings**, not complete HTML/PDF reports or per-device policy simulations. Treat the consolidated file as confidential assessment data.
+
+## v3.1.0 preview: Panorama inheritance diagnostics
+
+The coverage JSON now includes `panorama_inheritance_preview`, a privacy-safe, count-only
+device-group ancestry and policy-layer composition diagnostic. It lists shared pre-rules,
+ancestor-to-child pre-rules, child-to-ancestor post-rules and shared post-rules.
+This is **not** effective per-device policy: targets, local overrides, templates,
+rule enablement, and runtime state remain unresolved. No new vulnerability findings
+are generated from these counts. Missing parents, duplicate names and cycles are
+reported as limitations. Do not publish this preview as a validated stable release.
+
+## Preview 2: target diagnostics
+
+The coverage JSON includes `panorama_targeting_preview` with raw-rule counts by
+explicit target structure and enablement. This is **not** effective per-device
+applicability. Device targeting, serial/vsys membership and runtime overrides
+are not resolved. Findings are intentionally unchanged.
+
+### Preview 3 targeting diagnostics
+
+The `panorama_targeting_preview` coverage section classifies a missing target,
+empty target, or `<target><negate>no</negate></target>` as
+`NO_EXPLICIT_TARGET`. Explicit device entries are categorized as inclusion or
+exclusion based on `negate`; malformed or ambiguous structures remain
+`UNKNOWN_TARGET_SHAPE`. These categories describe XML targeting structure,
+**not effective firewall policy applicability**. No device serial numbers or
+rule names are exported by the targeting preview.
+
+Expected targeting distribution for the previously inspected 45,374-rule
+Panorama snapshot: `NO_EXPLICIT_TARGET: 45374`, unknown: 0. This is a
+Kali-side acceptance target, not a full-snapshot test performed in this package.
+
+Run `python3 test_v310_preview3.py` to check the classifier.
+
+### Preview 4: device-group membership diagnostics
+The coverage JSON now includes `panorama_membership_preview`. It reports aggregate assigned-device and VSYS assignment counts without exporting serial numbers or VSYS names. Multiple-group assignments and malformed VSYS structures are flagged. This is diagnostic-only and does not prove per-firewall policy applicability.
+
+
+### Preview 5: VSYS-aware candidate mapping
+The coverage JSON includes `panorama_candidate_mapping_preview`, with privacy-safe assignment IDs, ordered shared/ancestor/child policy sources and candidate/disabled/target counts. These are **not** deployed or effective policy counts. `DEVICE_ONLY` is not automatically interpreted as `vsys1`.
+
+
+### Preview 6: candidate applicability diagnostics
+
+Panorama coverage JSON includes `panorama_applicability_preview`, with per-assignment and aggregate counts for candidate rules, enablement, target eligibility, unresolved targeting and unique referenced XML source occurrences. `configuration_eligible_candidate` is **not** proof of deployment or enforcement. The diagnostic does not modify findings.
+
+Inspect: `jq '.panorama_applicability_preview | {status, assignment_count, issues, unique_policy_source_occurrences_referenced, candidate_policy_references, by_type, effective_device_applicability}' H4wkEye-coverage.json`
+
+
+### Preview 7 reconciliation diagnostics
+Coverage JSON now includes `panorama_reconciliation_preview`, with source-to-candidate consistency, targeting coverage, and enablement/eligibility partitions. The values are assignment-level references, not deployed policies. Check `issues` and `status` before interpreting results.
+
+### Preview 8: consolidated reporting
+
+Preview 8 groups compatible findings in reports while retaining complete rule-level evidence. PDF evidence is always fully expanded and includes all affected rule rows, including IP/object context, without collapsible sections. CSV emits a summary (`H4wkEye-report.csv`) and detail evidence (`H4wkEye-evidence.csv`); batch `--combined-csv` emits `combined-findings.csv` and `combined-evidence.csv`. JSON stores nested `affected_rules`. Use `--no-group-findings` to preserve one report finding per detection.
+
+Grouping does not change detection logic. It groups only findings with matching section, title, severity, confidence, status, description, remediation and risk score. All original per-rule evidence is retained.
