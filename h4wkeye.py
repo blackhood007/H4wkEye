@@ -997,7 +997,8 @@ class Scanner:
         matches = [g for (s, n), g in self.ike_gateways.items() if n == name]
         return matches[0] if matches else None
 
-    def discover_ipsec_tunnels(self):        for entry in self.root.findall(".//network/tunnel/ipsec/entry"):
+    def discover_ipsec_tunnels(self):
+        for entry in self.root.findall(".//network/tunnel/ipsec/entry"):
             name = entry.get("name")
             if not name:
                 continue
