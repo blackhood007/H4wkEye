@@ -2996,7 +2996,8 @@ def panorama_candidate_mapping_preview(scanner):
             if node is not None:
                 for kind in kinds:
                     for rule in node.findall(f'./{layer}/{kind}/rules/entry'):
-                        source_counts[kind] += 1                        counts[kind]['candidate'] += 1
+                        source_counts[kind] += 1
+                        counts[kind]['candidate'] += 1
                         disabled = (rule.findtext('./disabled') or '').strip().lower()
                         if disabled == 'yes':
                             counts[kind]['disabled'] += 1
