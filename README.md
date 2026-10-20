@@ -1,4 +1,4 @@
-# H4wkEye 🦅
+# H4wkEye
 
 **Offline PAN-OS / Panorama XML Configuration Security Scanner**
 
