@@ -25,7 +25,7 @@ from collections import Counter, defaultdict
 from datetime import datetime
 from pathlib import Path
 
-VERSION = "3.0.10"
+VERSION = "3.1.0-preview.8"
 
 DEFAULT_BASELINE = {
     "weak_encryption": ["des", "3des"],
@@ -997,8 +997,7 @@ class Scanner:
         matches = [g for (s, n), g in self.ike_gateways.items() if n == name]
         return matches[0] if matches else None
 
-    def discover_ipsec_tunnels(self):
-        for entry in self.root.findall(".//network/tunnel/ipsec/entry"):
+    def discover_ipsec_tunnels(self):        for entry in self.root.findall(".//network/tunnel/ipsec/entry"):
             name = entry.get("name")
             if not name:
                 continue
@@ -1736,6 +1735,74 @@ class Scanner:
         return rows
 
 
+REPORT_EVIDENCE_FIELDS = [
+    "object", "scope", "source_zones", "source_objects", "resolved_sources",
+    "destination_zones", "destination_objects", "resolved_destinations",
+    "applications", "services", "evidence", "status", "confidence", "risk_score",
+]
+
+
+def consolidate_findings(findings):
+    """Group equivalent rule findings; preserve each detection as a full evidence row."""
+    rule_sections = {"Firewall Rules", "Decryption Rules", "NAT Rules"}
+    groups = {}
+    ordered = []
+    for finding in findings:
+        # Consolidate rule-level findings only. Non-rule findings remain separate
+        # to avoid merging distinct VPN, management or platform objects.
+        is_rule = finding.get("section") in rule_sections and bool(finding.get("object"))
+        if is_rule:
+            key = tuple(finding.get(field, "") for field in (
+                "section", "title", "severity", "confidence", "status", "scope",
+                "description", "remediation", "risk_score",
+            ))
+        else:
+            key = ("SINGLE", finding.get("finding_id", ""))
+        if key not in groups:
+            group = dict(finding)
+            group["affected_rules"] = []
+            group["original_finding_ids"] = []
+            group["affected_count"] = 0
+            groups[key] = group
+            ordered.append(group)
+        group = groups[key]
+        row = {field: finding.get(field, "") for field in REPORT_EVIDENCE_FIELDS}
+        row["original_finding_id"] = finding.get("finding_id", "")
+        group["affected_rules"].append(row)
+        if finding.get("finding_id"):
+            group["original_finding_ids"].append(finding["finding_id"])
+        group["affected_count"] += 1
+
+    for group in ordered:
+        count = group["affected_count"]
+        if count > 1:
+            group["evidence"] = (
+                f"{count} matching rule-level detections consolidated. "
+                "Review the complete affected-rule evidence table for per-rule details."
+            )
+            group["object"] = f"{group.get('title', 'Finding')} ({count} affected)"
+    return ordered
+
+
+def evidence_rows(findings):
+    """Flatten consolidated findings into one complete row per source finding."""
+    rows = []
+    for finding in findings:
+        affected = finding.get("affected_rules") or []
+        if not affected:
+            affected = [{field: finding.get(field, "") for field in REPORT_EVIDENCE_FIELDS}]
+        for row in affected:
+            rows.append({
+                "finding_id": finding.get("finding_id", ""),
+                "title": finding.get("title", ""),
+                "severity": finding.get("severity", ""),
+                "section": finding.get("section", ""),
+                "affected_count": finding.get("affected_count", 1),
+                **row,
+            })
+    return rows
+
+
 def write_json(path, data):
     Path(path).write_text(json.dumps(data, indent=2), encoding="utf-8")
 
@@ -1747,7 +1814,7 @@ def csv_fields():
         "scope", "risk_score", "source_zones", "source_objects",
         "resolved_sources", "destination_zones", "destination_objects",
         "resolved_destinations", "applications", "services",
-        "description", "evidence", "remediation",
+        "description", "evidence", "remediation", "affected_count", "original_finding_ids",
     ]
 
 
@@ -1755,7 +1822,19 @@ def write_csv(path, findings):
     with open(path, "w", newline="", encoding="utf-8-sig") as f:
         writer = csv.DictWriter(f, fieldnames=csv_fields(), extrasaction="ignore")
         writer.writeheader()
-        writer.writerows(findings)
+        for finding in findings:
+            row = dict(finding)
+            row["original_finding_ids"] = ";".join(finding.get("original_finding_ids", []))
+            writer.writerow(row)
+
+
+def write_evidence_csv(path, findings):
+    fields = ["finding_id", "title", "severity", "section", "affected_count",
+              "original_finding_id", *REPORT_EVIDENCE_FIELDS]
+    with open(path, "w", newline="", encoding="utf-8-sig") as f:
+        writer = csv.DictWriter(f, fieldnames=fields, extrasaction="ignore")
+        writer.writeheader()
+        writer.writerows(evidence_rows(findings))
 
 
 def write_html(path, data):
@@ -1845,6 +1924,29 @@ def write_html(path, data):
     ordered_sections = [s for s in section_order if s in section_counts]
     ordered_sections += [s for s in section_counts if s not in section_order]
 
+    def html_evidence_table(finding, esc):
+        rows = evidence_rows([finding])
+        if not rows:
+            return ""
+        columns = [
+            ("Rule / Object [Original ID]", "object"), ("Scope", "scope"),
+            ("Source IP / Object", "resolved_sources"),
+            ("Destination IP / Object", "resolved_destinations"),
+            ("Zones", "source_zones"), ("Destination Zones", "destination_zones"),
+            ("Applications", "applications"), ("Services", "services"), ("Action / Evidence", "evidence"),
+        ]
+        head = "".join(f"<th>{esc(label)}</th>" for label, _ in columns)
+        body = []
+        for row in rows:
+            cells = []
+            for label, field in columns:
+                value = row.get(field, "")
+                if field == "object" and row.get("original_finding_id"):
+                    value = f"{value} [{row.get('original_finding_id')}]"
+                cells.append(f"<td>{esc(value)}</td>")
+            body.append("<tr>" + "".join(cells) + "</tr>")
+        return f'<h4>Affected rules ({len(rows)})</h4><table class="context-table"><thead><tr>{head}</tr></thead><tbody>{"".join(body)}</tbody></table>'
+
     findings_html = []
     for section in ordered_sections:
         items = [x for x in findings if x.get("section") == section]
@@ -1874,15 +1976,16 @@ def write_html(path, data):
                 '<div class="finding-head"><div>'
                 f'<span class="badge severity-{sev.lower()}">{esc(sev)}</span>'
                 f'<span class="finding-id">{esc(x.get("finding_id",""))}</span>'
-                f'<h3>{esc(x.get("title"))}</h3></div>'
+                f'<h3>{esc(x.get("title"))} <span class="finding-id">({int(x.get("affected_count",1))} affected)</span></h3></div>'
                 f'<div class="confidence">{esc(x.get("confidence"))}</div></div>'
                 f'<p class="description">{esc(x.get("description"))}</p>'
                 '<div class="finding-grid"><div><h4>Evidence</h4>'
                 f'<div class="evidence">{esc(x.get("evidence"))}</div></div>'
                 '<div><h4>Remediation</h4>'
                 f'<div class="remediation">{esc(x.get("remediation"))}</div></div></div>'
-                '<details><summary>Technical context</summary>'
-                f'<table class="context-table">{"".join(context_rows)}</table></details>'
+                '<details><summary>Technical context and affected rules</summary>'
+                f'<table class="context-table">{"".join(context_rows)}</table>'
+                f'{html_evidence_table(x, esc)}</details>'
                 '</article>'
             )
 
@@ -1894,7 +1997,6 @@ def write_html(path, data):
             f'<section class="report-section"><div class="section-title">'
             f'<h2>{esc(section)}</h2><div>{chips}</div></div>{"".join(cards)}</section>'
         )
-
     rule_stats_rows = "".join(
         f"<tr><td>{esc(k)}</td><td>{int(v):,}</td></tr>"
         for k, v in rule_stats.items()
@@ -1926,6 +2028,7 @@ def write_html(path, data):
     generated = esc(meta.get("generated_at", ""))
     config_name = esc(meta.get("configuration", "PAN-OS XML configuration"))
     scanner_version = esc(meta.get("scanner_version", VERSION))
+    detected_count = int(meta.get("detected_finding_count", len(findings)) or 0)
     logo_uri = load_logo_data_uri()
     logo_html = (f'<img class="brand-logo" src="{logo_uri}" alt="H4wkEye logo">' if logo_uri else '<div class="brand-word">H4wkEye</div>')
 
@@ -1964,7 +2067,7 @@ details{{margin-top:13px}} summary{{cursor:pointer;color:#3457d5;font-weight:700
 <main>
 <div class="hero">
 <section class="panel"><h2>Executive Summary</h2><p><span class="risk-pill severity-{overall.lower()}">Overall assessment: {overall}</span></p>
-<p>The assessment identified <strong>{len(findings)}</strong> findings. <strong>{high_critical}</strong> are High/Critical priority, <strong>{confirmed}</strong> are confirmed by configuration evidence, and <strong>{review}</strong> require contextual validation.</p>
+<p>The assessment identified <strong>{len(findings)}</strong> consolidated finding groups covering <strong>{detected_count}</strong> original detection(s). <strong>{high_critical}</strong> groups are High/Critical priority, <strong>{confirmed}</strong> are confirmed by configuration evidence, and <strong>{review}</strong> require contextual validation.</p>
 <ul>{observation_html}</ul></section>
 <section class="panel"><h2>Risk Distribution</h2>{bars}<p class="note">Business impact and live reachability can change final risk.</p></section>
 </div>
@@ -1995,7 +2098,7 @@ def write_pdf(path, data):
     try:
         from reportlab.lib import colors
         from reportlab.lib.enums import TA_CENTER
-        from reportlab.lib.pagesizes import A4
+        from reportlab.lib.pagesizes import A4, landscape
         from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
         from reportlab.lib.units import mm
         from reportlab.platypus import (
@@ -2013,6 +2116,7 @@ def write_pdf(path, data):
     rule_stats = data.get("rule_statistics", {})
     vpn_inventory = data.get("vpn_inventory", [])
     meta = data.get("metadata", {})
+    detected_count = int(meta.get("detected_finding_count", len(findings)) or 0)
 
     sev_order = ["CRITICAL", "HIGH", "MEDIUM", "LOW", "INFO"]
     sev_counts = Counter(x.get("severity", "INFO") for x in findings)
@@ -2090,15 +2194,15 @@ def write_pdf(path, data):
     def footer(canvas, doc):
         canvas.saveState()
         canvas.setStrokeColor(palette["line"])
-        canvas.line(18*mm, 13*mm, A4[0]-18*mm, 13*mm)
+        canvas.line(18*mm, 13*mm, doc.pagesize[0]-18*mm, 13*mm)
         canvas.setFont("Helvetica", 7)
         canvas.setFillColor(palette["muted"])
         canvas.drawString(18*mm, 8*mm, f"H4wkEye v{VERSION} - Offline Configuration Security Scanner")
-        canvas.drawRightString(A4[0]-18*mm, 8*mm, f"Page {doc.page}")
+        canvas.drawRightString(doc.pagesize[0]-18*mm, 8*mm, f"Page {doc.page}")
         canvas.restoreState()
 
     doc = SimpleDocTemplate(
-        str(path), pagesize=A4, rightMargin=16*mm, leftMargin=16*mm,
+        str(path), pagesize=landscape(A4), rightMargin=15*mm, leftMargin=15*mm,
         topMargin=15*mm, bottomMargin=18*mm,
         title="H4wkEye PAN-OS Security Assessment",
         author="H4wkEye"
@@ -2124,8 +2228,9 @@ def write_pdf(path, data):
         Spacer(1, 5*mm),
         Paragraph("Executive Summary", h1),
         P(
-            f"Overall assessment: {overall}. The assessment identified {len(findings)} findings. "
-            f"{high_critical} are High/Critical priority, {confirmed} are confirmed by configuration "
+            f"Overall assessment: {overall}. The assessment identified {len(findings)} consolidated finding groups "
+            f"covering {detected_count} original detection(s). {high_critical} groups are High/Critical priority, "
+            f"{confirmed} are confirmed by configuration "
             f"evidence, and {review} require contextual validation."
         ),
     ]
@@ -2194,7 +2299,7 @@ def write_pdf(path, data):
             header = Table(
                 [[P(sev, white_center),
                   P(x.get("finding_id",""), label),
-                  P(x.get("title",""), finding_title)]],
+                  P(f"{x.get('title','')} ({int(x.get('affected_count',1))} affected)", finding_title)]],
                 colWidths=[23*mm, 27*mm, 115*mm]
             )
             header.setStyle(TableStyle([
@@ -2276,6 +2381,38 @@ def write_pdf(path, data):
                     ("TOPPADDING",(0,0),(-1,-1),3),("BOTTOMPADDING",(0,0),(-1,-1),3),
                 ]))
                 block += [Paragraph("Technical Context", h2), ct]
+            affected = x.get("affected_rules") or []
+            if affected:
+                block += [Paragraph(f"Affected Rules and Complete Technical Evidence ({len(affected)})", h2)]
+                evidence_data = [[P("Rule / Object", label), P("Source IP/CIDR + context", label),
+                                 P("Destination IP/CIDR + context", label), P("Application / Service", label),
+                                 P("Scope", label), P("Technical Evidence", label)]]
+                for row in affected:
+                    src_parts = []
+                    for caption, key in (("Resolved IP/CIDR", "resolved_sources"),
+                                         ("Object", "source_objects"), ("Zone", "source_zones")):
+                        if row.get(key):
+                            src_parts.append(f"{caption}: {row.get(key)}")
+                    dst_parts = []
+                    for caption, key in (("Resolved IP/CIDR", "resolved_destinations"),
+                                         ("Object", "destination_objects"), ("Zone", "destination_zones")):
+                        if row.get(key):
+                            dst_parts.append(f"{caption}: {row.get(key)}")
+                    appsvc = " | ".join(f"{caption}: {row.get(key)}" for caption, key in
+                                         (("Application", "applications"), ("Service", "services")) if row.get(key))
+                    evidence_data.append([P(row.get("object", ""), small), P("\n".join(src_parts) or "Not specified", small),
+                                         P("\n".join(dst_parts) or "Not specified", small), P(appsvc or "Not specified", small),
+                                         P(row.get("scope", ""), small), P(row.get("evidence", ""), small)])
+                ev_table = LongTable(evidence_data, colWidths=[31*mm, 51*mm, 51*mm, 43*mm, 36*mm, 52*mm],
+                                     repeatRows=1, splitByRow=1, splitInRow=1)
+                ev_table.setStyle(TableStyle([
+                    ("BACKGROUND", (0,0), (-1,0), palette["panel"]),
+                    ("GRID", (0,0), (-1,-1), 0.3, palette["line"]),
+                    ("VALIGN", (0,0), (-1,-1), "TOP"),
+                    ("TOPPADDING", (0,0), (-1,-1), 4),
+                    ("BOTTOMPADDING", (0,0), (-1,-1), 4),
+                ]))
+                block += [ev_table]
             block += [Spacer(1,5*mm)]
             story += block
 
@@ -2504,6 +2641,710 @@ def panorama_diagnostics(scanner):
         ],
     }
 
+
+
+def panorama_inheritance_preview(scanner):
+    """Privacy-safe device-group policy composition diagnostics.
+
+    Produces *counts* in pre/leaf/post evaluation order, not effective firewall
+    policy or findings. Does not expand templates, targets or local overrides.
+    """
+    root = scanner.root
+    entries = (root.findall("./devices/entry/device-group/entry") +
+               root.findall("./device-group/entry"))
+    shared = root.find("./shared")
+    names = [e.get("name", "") for e in entries]
+    from collections import Counter as _Counter
+    counts = _Counter(names)
+    aliases = {name: f"DG-{i:03d}" for i, name in enumerate(sorted(set(names)), 1) if name}
+    by_name = {e.get("name"): e for e in entries if e.get("name")}
+    problems = []
+    if any(n != 1 for n in counts.values()):
+        problems.append("DUPLICATE_DEVICE_GROUP_IDENTITY")
+    if any(not n for n in names):
+        problems.append("MISSING_DEVICE_GROUP_IDENTITY")
+    parents = {name: text_of(e, "./parent-dg").strip() for name, e in by_name.items()}
+    if any(p and p not in by_name for p in parents.values()):
+        problems.append("MISSING_PARENT_DEVICE_GROUP")
+    def rule_counts(node, layer):
+        if node is None:
+            return {k: 0 for k in ("security", "nat", "decryption")}
+        return {k: len(node.findall(f"./{layer}/{k}/rules/entry"))
+                for k in ("security", "nat", "decryption")}
+    shared_pre = rule_counts(shared, "pre-rulebase")
+    shared_post = rule_counts(shared, "post-rulebase")
+    records = []
+    for name in sorted(by_name):
+        chain = []
+        visited = set()
+        cur = name
+        issue = None
+        while cur:
+            if cur in visited:
+                issue = "PARENT_CYCLE"
+                break
+            if cur not in by_name:
+                issue = "MISSING_PARENT_DEVICE_GROUP"
+                break
+            visited.add(cur)
+            chain.append(cur)
+            cur = parents[cur]
+        chain.reverse()
+        if issue:
+            problems.append(issue)
+        layers = []
+        layers.append(("shared_pre", shared_pre))
+        for ancestor in chain:
+            layers.append(("dg_pre", rule_counts(by_name[ancestor], "pre-rulebase")))
+        for ancestor in reversed(chain):
+            layers.append(("dg_post", rule_counts(by_name[ancestor], "post-rulebase")))
+        layers.append(("shared_post", shared_post))
+        totals = {kind: sum(c[kind] for _, c in layers) for kind in ("security", "nat", "decryption")}
+        records.append({
+            "device_group_id": aliases.get(name, "UNRESOLVED-DG"),
+            "ancestor_chain": [aliases.get(n, "UNRESOLVED-DG") for n in chain],
+            "composition": [{"source": source, "counts": value} for source, value in layers],
+            "candidate_policy_counts": totals,
+            "status": "BLOCKED" if issue or counts[name] != 1 else "DIAGNOSTIC_ONLY",
+            "blocking_reason": issue or ("DUPLICATE_DEVICE_GROUP_IDENTITY" if counts[name] != 1 else None),
+        })
+    return {
+        "schema_version": "0.1",
+        "mode": "candidate_policy_count_composition_only",
+        "status": "PARTIAL" if problems else "DIAGNOSTIC_ONLY",
+        "problems": sorted(set(problems)),
+        "device_group_count": len(entries),
+        "shared_pre_counts": shared_pre,
+        "shared_post_counts": shared_post,
+        "device_groups": records,
+        "limitations": [
+            "Counts are not effective firewall policy or vulnerability findings.",
+            "Device targets, disabled rules, rule overrides, and runtime state are not resolved.",
+            "Template stacks, device-local rules, and pushed configuration are not merged.",
+            "Repeated ancestor policies in different device-group views are expected.",
+        ],
+    }
+
+
+def classify_panorama_rule_target(rule):
+    """Classify target XML conservatively; never infer device applicability.
+
+    A missing target or a target with only <negate>no</negate> has no
+    explicit device restriction. A negated target without devices is
+    ambiguous and stays UNKNOWN. Validate known device/vsys container
+    shapes rather than treating arbitrary children as device selectors.
+    """
+    target = rule.find("./target")
+    if target is None:
+        return "NO_EXPLICIT_TARGET"
+    if (target.text or "").strip():
+        return "UNKNOWN_TARGET_SHAPE"
+    children = list(target)
+    if not children:
+        return "NO_EXPLICIT_TARGET"
+    if any(child.tag not in ("negate", "devices") for child in children):
+        return "UNKNOWN_TARGET_SHAPE"
+    if sum(child.tag == "negate" for child in children) > 1 or sum(child.tag == "devices" for child in children) > 1:
+        return "UNKNOWN_TARGET_SHAPE"
+    negate_node = target.find("./negate")
+    negate = (negate_node.text or "").strip().lower() if negate_node is not None else "no"
+    if negate not in ("yes", "no") or (negate_node is not None and len(negate_node)):
+        return "UNKNOWN_TARGET_SHAPE"
+    devices = target.find("./devices")
+    if devices is None:
+        return "NO_EXPLICIT_TARGET" if negate == "no" else "UNKNOWN_TARGET_SHAPE"
+    if (devices.text or "").strip():
+        return "UNKNOWN_TARGET_SHAPE"
+    entries = list(devices)
+    if not entries:
+        return "NO_EXPLICIT_TARGET" if negate == "no" else "UNKNOWN_TARGET_SHAPE"
+    for entry in entries:
+        if entry.tag != "entry" or not (entry.get("name") or "").strip():
+            return "UNKNOWN_TARGET_SHAPE"
+        if (entry.text or "").strip() or any(k != "name" for k in entry.attrib):
+            return "UNKNOWN_TARGET_SHAPE"
+        if any(child.tag != "vsys" for child in entry):
+            return "UNKNOWN_TARGET_SHAPE"
+        if len(entry.findall("./vsys")) > 1:
+            return "UNKNOWN_TARGET_SHAPE"
+        vsys = entry.find("./vsys")
+        if vsys is not None:
+            if (vsys.text or "").strip() or not len(vsys):
+                return "UNKNOWN_TARGET_SHAPE"
+            if any(v.tag != "entry" or not (v.get("name") or "").strip() or len(v) or (v.text or "").strip() for v in vsys):
+                return "UNKNOWN_TARGET_SHAPE"
+    return "EXPLICIT_TARGET_EXCLUSION" if negate == "yes" else "EXPLICIT_TARGET_INCLUSION"
+
+
+def panorama_targeting_preview(scanner):
+    """Aggregate, privacy-safe target/disabled diagnostics, not effective policy.
+
+    Traverses raw shared and device-group rule containers once, avoiding
+    counting inherited rules repeatedly. No device serials or rule names leave
+    the scanner. Unknown target shapes remain unknown, never assumed allowed.
+    """
+    from collections import Counter as _Counter
+    root = scanner.root
+    groups = root.findall("./devices/entry/device-group/entry") + root.findall("./device-group/entry")
+    scopes = [("shared", root.find("./shared"))] + [("device_group", e) for e in groups]
+    kinds = ("security", "nat", "decryption")
+    tally = _Counter()
+    by_type = {k: _Counter() for k in kinds}
+    by_layer = {k: _Counter() for k in ("pre-rulebase", "post-rulebase")}
+    sample_limit = 0  # No names, identifiers, or rule contents in diagnostics.
+    for scope, node in scopes:
+        if node is None:
+            continue
+        for layer in ("pre-rulebase", "post-rulebase"):
+            for kind in kinds:
+                for rule in node.findall(f"./{layer}/{kind}/rules/entry"):
+                    disabled = text_of(rule, "./disabled").lower()
+                    if disabled == "yes":
+                        state = "DISABLED"
+                    elif disabled in ("", "no"):
+                        state = "ENABLED_OR_UNSPECIFIED"
+                    else:
+                        state = "UNKNOWN_ENABLEMENT"
+                    target_state = classify_panorama_rule_target(rule)
+                    tally["total_rules"] += 1
+                    tally["enablement:" + state] += 1
+                    tally["target:" + target_state] += 1
+                    by_type[kind]["total"] += 1
+                    by_type[kind]["target:" + target_state] += 1
+                    by_layer[layer][kind] += 1
+    return {
+        "schema_version": "0.3",
+        "status": "DIAGNOSTIC_ONLY",
+        "mode": "raw_rule_target_and_enablement_inventory",
+        "raw_rules_visited": tally["total_rules"],
+        "enablement": {k.removeprefix("enablement:"): v for k, v in sorted(tally.items()) if k.startswith("enablement:")},
+        "targeting": {k.removeprefix("target:"): v for k, v in sorted(tally.items()) if k.startswith("target:")},
+        "by_type": {k: dict(v) for k, v in by_type.items()},
+        "by_layer": {k: dict(v) for k, v in by_layer.items()},
+        "effective_device_applicability": "NOT_EVALUATED",
+        "limitations": [
+            "No per-firewall applicability claim is made: device membership, serial/vsys mapping, and target semantics are not resolved.",
+            "Explicit targets are classified structurally, not interpreted as effective inclusion or exclusion.",
+            "Inherited views are not duplicated in these raw-rule counts.",
+            "Existing vulnerability detection and report findings are unchanged.",
+        ],
+    }
+
+
+
+def panorama_membership_preview(scanner):
+    """Inventory Panorama DG device/VSYS assignments without exposing identities.
+
+    A device-group assignment is not proof of effective policy deployment.
+    Missing/ambiguous assignments remain unresolved. No rule findings change.
+    """
+    from collections import Counter as _Counter, defaultdict as _defaultdict
+    root = scanner.root
+    groups = (root.findall("./devices/entry/device-group/entry") +
+              root.findall("./device-group/entry"))
+    names = [g.get("name", "").strip() for g in groups]
+    counts = _Counter(names)
+    aliases = {name: f"DG-{i:03d}" for i, name in enumerate(sorted(set(names)), 1) if name}
+    memberships = _defaultdict(list)
+    issues = _Counter()
+    rows = []
+    for group in groups:
+        name = (group.get("name") or "").strip()
+        members = group.findall("./devices/entry")
+        group_devices = set()
+        vsys_assignments = 0
+        for member in members:
+            serial = (member.get("name") or "").strip()
+            if not serial:
+                issues["MISSING_DEVICE_IDENTITY"] += 1
+                continue
+            if serial in group_devices:
+                issues["DUPLICATE_DEVICE_IN_GROUP"] += 1
+            group_devices.add(serial)
+            vsys = member.find("./vsys")
+            if vsys is None:
+                membership_type = "DEVICE_ONLY"
+                vsys_values = ()
+            else:
+                vsys_entries = vsys.findall("./entry")
+                vsys_values = tuple(v.get("name", "").strip() for v in vsys_entries)
+                if not vsys_values or any(not v for v in vsys_values) or len(vsys_values) != len(set(vsys_values)) or len(list(vsys)) != len(vsys_entries):
+                    issues["UNRESOLVED_VSYS_SHAPE"] += 1
+                    membership_type = "UNKNOWN_VSYS"
+                else:
+                    membership_type = "EXPLICIT_VSYS"
+                    vsys_assignments += len(vsys_values)
+            memberships[serial].append((name, membership_type, vsys_values))
+        rows.append({
+            "device_group_id": aliases.get(name, "UNRESOLVED-DG"),
+            "assigned_device_entries": len(members),
+            "unique_device_identities": len(group_devices),
+            "explicit_vsys_assignments": vsys_assignments,
+            "status": "UNRESOLVED" if not name or counts[name] != 1 else "INVENTORIED",
+        })
+    if any(not n for n in names):
+        issues["MISSING_DEVICE_GROUP_IDENTITY"] += 1
+    if any(v > 1 for v in counts.values()):
+        issues["DUPLICATE_DEVICE_GROUP_IDENTITY"] += 1
+    for serial, assignments in memberships.items():
+        distinct_groups = {g for g, _, _ in assignments}
+        if len(distinct_groups) > 1:
+            issues["DEVICE_IN_MULTIPLE_GROUPS"] += 1
+    assignment_kinds = _Counter(t for a in memberships.values() for _, t, _ in a)
+    return {
+        "schema_version": "0.1",
+        "status": "PARTIAL" if issues else "DIAGNOSTIC_ONLY",
+        "mode": "device_group_assignment_inventory_only",
+        "device_group_count": len(groups),
+        "unique_assigned_devices": len(memberships),
+        "total_device_assignment_entries": sum(r["assigned_device_entries"] for r in rows),
+        "assignment_shapes": dict(sorted(assignment_kinds.items())),
+        "issues": dict(sorted(issues.items())),
+        "device_groups": rows,
+        "effective_device_applicability": "NOT_EVALUATED",
+        "limitations": [
+            "Device group assignments do not prove policies were pushed or are effective.",
+            "Device-local overrides, templates, operational state, and target-device resolution are not evaluated.",
+            "Device identifiers and VSYS names are not exported.",
+            "Device assignment counts do not deduplicate inherited candidate policies.",
+        ],
+    }
+
+
+
+def panorama_candidate_mapping_preview(scanner):
+    """Privacy-safe VSYS-aware candidate counts; never asserts deployed policy.
+
+    Assignments with no VSYS are device-scoped and are NOT interpreted as vsys1.
+    A candidate is a rule present in the composed DG rulebase, regardless of
+    target restrictions. Explicit targeting and malformed enablement remain
+    unresolved instead of being counted as confirmed applicable.
+    """
+    from collections import Counter as _Counter, defaultdict as _defaultdict
+    root = scanner.root
+    groups = root.findall("./devices/entry/device-group/entry") + root.findall("./device-group/entry")
+    names = [(g.get("name") or "").strip() for g in groups]
+    name_counts = _Counter(names)
+    by_name = {n: g for n, g in zip(names, groups) if n}
+    aliases = {n: f"DG-{i:03d}" for i, n in enumerate(sorted(set(names)), 1) if n}
+    kinds = ("security", "nat", "decryption")
+    shared = root.find("./shared")
+    issues = _Counter()
+    records = []
+    # Do not export the private mapping or actual device/VSYS identities.
+    assignments = _defaultdict(set)
+    for group, name in zip(groups, names):
+        if not name or name_counts[name] != 1:
+            issues["UNRESOLVED_DEVICE_GROUP_IDENTITY"] += 1
+            continue
+        for member in group.findall("./devices/entry"):
+            serial = (member.get("name") or "").strip()
+            if not serial:
+                issues["MISSING_DEVICE_IDENTITY"] += 1
+                continue
+            vsys = member.find("./vsys")
+            if vsys is None:
+                assignments[(serial, None)].add(name)
+                continue
+            entries = vsys.findall("./entry")
+            if not entries or len(entries) != len(list(vsys)) or (vsys.text or "").strip():
+                issues["UNRESOLVED_VSYS_SHAPE"] += 1
+                continue
+            values = [(e.get("name") or "").strip() for e in entries]
+            if not all(values) or len(values) != len(set(values)) or any(len(e) for e in entries):
+                issues["UNRESOLVED_VSYS_SHAPE"] += 1
+                continue
+            for v in values:
+                assignments[(serial, v)].add(name)
+    # Device-only plus VSYS-specific memberships on the same device require
+    # additional context, and must not be silently collapsed.
+    devices_with_vsys = {serial for serial, vsys in assignments if vsys is not None}
+    for serial, vsys in assignments:
+        if vsys is None and serial in devices_with_vsys:
+            issues["DEVICE_ONLY_OVERLAPS_EXPLICIT_VSYS"] += 1
+    def chain_for(name):
+        chain, seen = [], set()
+        current = name
+        while current:
+            if current in seen:
+                return None, "PARENT_CYCLE"
+            if current not in by_name or name_counts[current] != 1:
+                return None, "MISSING_OR_DUPLICATE_PARENT"
+            seen.add(current)
+            chain.append(current)
+            current = (by_name[current].findtext("./parent-dg") or "").strip()
+        return list(reversed(chain)), None
+    def source_nodes(chain):
+        return ([('shared_pre', shared, 'pre-rulebase')]
+                + [('dg_pre', by_name[n], 'pre-rulebase') for n in chain]
+                + [('dg_post', by_name[n], 'post-rulebase') for n in reversed(chain)]
+                + [('shared_post', shared, 'post-rulebase')])
+    # Cache per-DG composition, avoiding repeated XML traversal for multiple VSYS.
+    cache = {}
+    def summarize(name):
+        if name in cache:
+            return cache[name]
+        chain, error = chain_for(name)
+        if error:
+            cache[name] = (None, error)
+            return cache[name]
+        counts = {kind: _Counter() for kind in kinds}
+        ordered_sources = []
+        for source, node, layer in source_nodes(chain):
+            source_counts = {kind: 0 for kind in kinds}
+            if node is not None:
+                for kind in kinds:
+                    for rule in node.findall(f'./{layer}/{kind}/rules/entry'):
+                        source_counts[kind] += 1                        counts[kind]['candidate'] += 1
+                        disabled = (rule.findtext('./disabled') or '').strip().lower()
+                        if disabled == 'yes':
+                            counts[kind]['disabled'] += 1
+                        elif disabled in ('', 'no'):
+                            counts[kind]['enabled_or_unspecified'] += 1
+                        else:
+                            counts[kind]['unknown_enablement'] += 1
+                        target = classify_panorama_rule_target(rule)
+                        if target == 'NO_EXPLICIT_TARGET':
+                            counts[kind]['no_explicit_target'] += 1
+                        elif target == 'UNKNOWN_TARGET_SHAPE':
+                            counts[kind]['unknown_target_shape'] += 1
+                        else:
+                            counts[kind]['explicit_target_requires_resolution'] += 1
+            ordered_sources.append({'source': source, 'counts': source_counts})
+        cache[name] = ({'ancestor_chain': [aliases[n] for n in chain],
+                        'ordered_sources': ordered_sources,
+                        'policy_counts': {k: dict(counts[k]) for k in kinds}}, None)
+        return cache[name]
+    for idx, ((serial, vsys), groups_for_assignment) in enumerate(sorted(assignments.items()), 1):
+        label = f'ASSIGNMENT-{idx:03d}'
+        if len(groups_for_assignment) != 1:
+            issues['CONFLICTING_VSYS_ASSIGNMENT'] += 1
+            records.append({'assignment_id': label, 'assignment_type': 'DEVICE_ONLY' if vsys is None else 'EXPLICIT_VSYS',
+                            'status': 'BLOCKED', 'reason': 'CONFLICTING_VSYS_ASSIGNMENT',
+                            'device_group_ids': [aliases[g] for g in sorted(groups_for_assignment)]})
+            continue
+        name = next(iter(groups_for_assignment))
+        composition, error = summarize(name)
+        records.append({'assignment_id': label,
+                        'assignment_type': 'DEVICE_ONLY' if vsys is None else 'EXPLICIT_VSYS',
+                        'device_group_id': aliases[name],
+                        'status': 'BLOCKED' if error else 'CANDIDATE_ONLY',
+                        'reason': error,
+                        **(composition or {})})
+        if error:
+            issues[error] += 1
+    # Avoid exposing serials even indirectly through shared pseudonyms.
+    return {'schema_version': '0.1', 'status': 'PARTIAL' if issues else 'DIAGNOSTIC_ONLY',
+            'mode': 'vsys_aware_candidate_policy_composition',
+            'assignment_count': len(records),
+            'assignment_types': dict(sorted(_Counter(r['assignment_type'] for r in records).items())),
+            'issues': dict(sorted(issues.items())),
+            'assignments': records,
+            'effective_device_applicability': 'NOT_EVALUATED',
+            'limitations': [
+                'Candidate counts do not establish installed or effective firewall policy.',
+                'Explicit target inclusion/exclusion is inventoried, not resolved for device/VSYS.',
+                'Device-only assignments are not assumed to be vsys1.',
+                'Template stacks, local overrides, runtime state and pushed configuration are not merged.',
+                'Inherited rules may be counted in multiple assignment views; raw inventory is unchanged.',
+                'Device and VSYS identities are not exported.'
+            ]}
+
+
+
+def panorama_applicability_preview(scanner):
+    """Conservative assignment-level targeting diagnostics, NOT effective policy.
+
+    Resolves only structurally valid explicit target selectors. Device-only
+    assignments cannot establish VSYS-specific selector matches. Policy identity
+    uses private XML scope, layer and position, never customer rule names.
+    """
+    from collections import Counter as _Counter, defaultdict as _defaultdict
+    root = scanner.root
+    groups = root.findall('./devices/entry/device-group/entry') + root.findall('./device-group/entry')
+    names = [(g.get('name') or '').strip() for g in groups]
+    duplicates = _Counter(names)
+    by_name = {n: g for n, g in zip(names, groups) if n and duplicates[n] == 1}
+    aliases = {n: f'DG-{i:03d}' for i, n in enumerate(sorted(set(names)), 1) if n}
+    kinds = ('security', 'nat', 'decryption')
+    issues = _Counter()
+    memberships = _defaultdict(set)
+    for name, group in zip(names, groups):
+        if name not in by_name:
+            issues['UNRESOLVED_DEVICE_GROUP_IDENTITY'] += 1
+            continue
+        for member in group.findall('./devices/entry'):
+            serial = (member.get('name') or '').strip()
+            if not serial:
+                issues['MISSING_DEVICE_IDENTITY'] += 1
+                continue
+            vsys = member.find('./vsys')
+            if vsys is None:
+                memberships[(serial, None)].add(name)
+                continue
+            entries = list(vsys)
+            values = [(e.get('name') or '').strip() for e in entries]
+            if (not entries or any(e.tag != 'entry' or len(e) or not v for e, v in zip(entries, values))
+                    or len(values) != len(set(values)) or (vsys.text or '').strip()):
+                issues['UNRESOLVED_VSYS_SHAPE'] += 1
+                continue
+            for v in values:
+                memberships[(serial, v)].add(name)
+    devices_with_vsys = {d for d, v in memberships if v is not None}
+    for device, vsys in memberships:
+        if vsys is None and device in devices_with_vsys:
+            issues['DEVICE_ONLY_OVERLAPS_EXPLICIT_VSYS'] += 1
+
+    def chain(name):
+        result, visited = [], set()
+        while name:
+            if name in visited:
+                return None, 'PARENT_CYCLE'
+            if name not in by_name:
+                return None, 'MISSING_OR_DUPLICATE_PARENT'
+            visited.add(name)
+            result.append(name)
+            name = (by_name[name].findtext('./parent-dg') or '').strip()
+        return list(reversed(result)), None
+
+    # Cache rule objects per device group: a rule may be referenced by many
+    # assignments, but each source occurrence has one distinct internal key.
+    rule_cache = {}
+    def rules_for(name):
+        if name in rule_cache:
+            return rule_cache[name]
+        ancestors, error = chain(name)
+        if error:
+            rule_cache[name] = (None, error)
+            return rule_cache[name]
+        sources = [('shared_pre', 'shared', root.find('./shared'), 'pre-rulebase')]
+        sources += [('dg_pre', n, by_name[n], 'pre-rulebase') for n in ancestors]
+        sources += [('dg_post', n, by_name[n], 'post-rulebase') for n in reversed(ancestors)]
+        sources += [('shared_post', 'shared', root.find('./shared'), 'post-rulebase')]
+        rows = []
+        for source, scope, node, layer in sources:
+            if node is None:
+                continue
+            for kind in kinds:
+                for index, rule in enumerate(node.findall(f'./{layer}/{kind}/rules/entry')):
+                    enable = (rule.findtext('./disabled') or '').strip().lower()
+                    enablement = 'DISABLED' if enable == 'yes' else ('ENABLED_OR_UNSPECIFIED' if enable in ('', 'no') else 'UNKNOWN_ENABLEMENT')
+                    shape = classify_panorama_rule_target(rule)
+                    target = rule.find('./target')
+                    negate = (target.findtext('./negate') or 'no').strip().lower() == 'yes' if target is not None else False
+                    selectors = []
+                    if shape in ('EXPLICIT_TARGET_INCLUSION', 'EXPLICIT_TARGET_EXCLUSION'):
+                        for device in target.findall('./devices/entry'):
+                            vsys = device.find('./vsys')
+                            selectors.append((device.get('name'), None if vsys is None else frozenset(v.get('name') for v in vsys.findall('./entry'))))
+                    # Identity remains private; only aggregate counts are exported.
+                    key = (scope, layer, kind, index)
+                    rows.append((key, kind, enablement, shape, negate, selectors))
+        rule_cache[name] = (rows, None)
+        return rule_cache[name]
+
+    def targeting(shape, negate, selectors, serial, vsys):
+        if shape == 'NO_EXPLICIT_TARGET':
+            return 'NO_EXPLICIT_TARGET'
+        if shape == 'UNKNOWN_TARGET_SHAPE':
+            return 'UNRESOLVED_TARGET'
+        # A device-wide selector is resolvable for both assignment types.
+        # A VSYS-scoped selector is unresolved for a device-only assignment
+        # when that device matches a VSYS-scoped target entry.
+        device_matches = [(v is None, v) for d, v in selectors if d == serial]
+        if vsys is None and any(not wide for wide, _ in device_matches):
+            return 'UNRESOLVED_TARGET'
+        matched = any(wide or (vsys is not None and vsys in values)
+                      for wide, values in device_matches)
+        allowed = not matched if negate else matched
+        return 'TARGET_ELIGIBLE' if allowed else 'TARGET_EXCLUDED'
+
+    results = []
+    all_keys = set()
+    reference_count = 0
+    totals = {k: _Counter() for k in kinds}
+    for index, ((serial, vsys), group_set) in enumerate(sorted(memberships.items()), 1):
+        record = {'assignment_id': f'ASSIGNMENT-{index:03d}',
+                  'assignment_type': 'DEVICE_ONLY' if vsys is None else 'EXPLICIT_VSYS'}
+        if len(group_set) != 1:
+            issues['CONFLICTING_VSYS_ASSIGNMENT'] += 1
+            record.update(status='BLOCKED', reason='CONFLICTING_VSYS_ASSIGNMENT')
+            results.append(record)
+            continue
+        name = next(iter(group_set))
+        record['device_group_id'] = aliases[name]
+        rules, error = rules_for(name)
+        if error:
+            issues[error] += 1
+            record.update(status='BLOCKED', reason=error)
+            results.append(record)
+            continue
+        per_type = {k: _Counter() for k in kinds}
+        seen_in_assignment = set()
+        for key, kind, enablement, shape, negate, selectors in rules:
+            if key in seen_in_assignment:
+                issues['DUPLICATE_POLICY_SOURCE_WITHIN_ASSIGNMENT'] += 1
+                continue
+            seen_in_assignment.add(key)
+            all_keys.add(key)
+            reference_count += 1
+            c = per_type[kind]
+            c['candidate'] += 1
+            c[enablement.lower()] += 1
+            target_state = targeting(shape, negate, selectors, serial, vsys)
+            c[target_state.lower()] += 1
+            if enablement == 'DISABLED':
+                c['disabled_not_eligible'] += 1
+            elif enablement == 'UNKNOWN_ENABLEMENT':
+                c['unresolved_applicability'] += 1
+            elif target_state == 'TARGET_EXCLUDED':
+                c['target_excluded_enabled'] += 1
+            elif target_state == 'UNRESOLVED_TARGET':
+                c['unresolved_applicability'] += 1
+            else:
+                c['configuration_eligible_candidate'] += 1
+        record.update(status='CANDIDATE_ONLY', policy_counts={k: dict(per_type[k]) for k in kinds})
+        results.append(record)
+        for kind in kinds:
+            totals[kind].update(per_type[kind])
+    return {
+        'schema_version': '0.1', 'status': 'PARTIAL' if issues else 'DIAGNOSTIC_ONLY',
+        'mode': 'conservative_target_and_enablement_candidate_diagnostics',
+        'assignment_count': len(results), 'issues': dict(sorted(issues.items())),
+        'unique_policy_source_occurrences_referenced': len(all_keys),
+        'candidate_policy_references': reference_count,
+        'by_type': {k: dict(totals[k]) for k in kinds},
+        'assignments': results,
+        'effective_device_applicability': 'NOT_EVALUATED',
+        'limitations': [
+            'Configuration-eligible candidates are not confirmed installed or enforced policies.',
+            'Target selectors are interpreted only for supported XML shapes; ambiguous device-only VSYS matches remain unresolved.',
+            'Policy identity is XML source occurrence, not semantic rule equivalence or deployed rule identity.',
+            'Unique source occurrences referenced are not the full raw Panorama policy inventory.',
+            'Local rules, overrides, template stacks, push status and runtime state are not merged.',
+            'No customer serial, VSYS or rule name is exported.'
+        ]
+    }
+
+def panorama_reconciliation_preview(candidate, applicability, raw_policy_entries=None):
+    """Preview 7: privacy-safe accounting audit of candidate versus applicability.
+
+    Operates solely on diagnostic aggregates, never on raw device identities.
+    A clean audit does not establish pushed configuration or enforcement.
+    """
+    from collections import Counter as _Counter
+    kinds = ('security', 'nat', 'decryption')
+    issues = _Counter()
+    candidate = candidate or {}
+    applicability = applicability or {}
+    raw = raw_policy_entries or {}
+    c_rows = {a.get('assignment_id'): a for a in candidate.get('assignments', [])}
+    a_rows = {a.get('assignment_id'): a for a in applicability.get('assignments', [])}
+    if len(c_rows) != len(candidate.get('assignments', [])) or len(a_rows) != len(applicability.get('assignments', [])):
+        issues['DUPLICATE_ASSIGNMENT_ID'] += 1
+    if set(c_rows) != set(a_rows):
+        issues['ASSIGNMENT_SET_MISMATCH'] += len(set(c_rows) ^ set(a_rows))
+    per_assignment = []
+    totals = {kind: _Counter() for kind in kinds}
+    targeting = _Counter()
+    enablement = _Counter()
+    blocked = 0
+    for aid in sorted(set(c_rows) | set(a_rows)):
+        c, a = c_rows.get(aid, {}), a_rows.get(aid, {})
+        if c.get('status') != 'CANDIDATE_ONLY' or a.get('status') != 'CANDIDATE_ONLY':
+            blocked += 1
+            per_assignment.append({'assignment_id': aid, 'status': 'BLOCKED_OR_UNRESOLVED'})
+            continue
+        if c.get('assignment_type') != a.get('assignment_type') or c.get('device_group_id') != a.get('device_group_id'):
+            issues['ASSIGNMENT_METADATA_MISMATCH'] += 1
+        rec = {'assignment_id': aid, 'assignment_type': a.get('assignment_type'),
+               'device_group_id': a.get('device_group_id'), 'status': 'RECONCILED', 'by_type': {}}
+        for kind in kinds:
+            old = c.get('policy_counts', {}).get(kind, {})
+            new = a.get('policy_counts', {}).get(kind, {})
+            n = int(new.get('candidate', 0))
+            if int(old.get('candidate', 0)) != n:
+                issues['CANDIDATE_COUNT_MISMATCH'] += 1
+                rec['status'] = 'MISMATCH'
+            disabled = int(new.get('disabled', 0))
+            enabled = int(new.get('enabled_or_unspecified', 0))
+            unknown = int(new.get('unknown_enablement', 0))
+            if n != disabled + enabled + unknown:
+                issues['ENABLEMENT_PARTITION_MISMATCH'] += 1
+                rec['status'] = 'MISMATCH'
+            for field in ('disabled', 'enabled_or_unspecified', 'unknown_enablement'):
+                if int(old.get(field, 0)) != int(new.get(field, 0)):
+                    issues['ENABLEMENT_COUNT_MISMATCH'] += 1
+                    rec['status'] = 'MISMATCH'
+            no_target = int(new.get('no_explicit_target', 0))
+            eligible_target = int(new.get('target_eligible', 0))
+            excluded_target = int(new.get('target_excluded', 0))
+            unresolved_target = int(new.get('unresolved_target', 0))
+            if n != no_target + eligible_target + excluded_target + unresolved_target:
+                issues['TARGET_PARTITION_MISMATCH'] += 1
+                rec['status'] = 'MISMATCH'
+            eligible = int(new.get('configuration_eligible_candidate', 0))
+            excluded_enabled = int(new.get('target_excluded_enabled', 0))
+            unresolved = int(new.get('unresolved_applicability', 0))
+            disabled_not = int(new.get('disabled_not_eligible', 0))
+            if n != eligible + excluded_enabled + unresolved + disabled_not:
+                issues['ELIGIBILITY_PARTITION_MISMATCH'] += 1
+                rec['status'] = 'MISMATCH'
+            fields = ('candidate', 'disabled', 'enabled_or_unspecified', 'unknown_enablement',
+                      'no_explicit_target', 'target_eligible', 'target_excluded', 'unresolved_target',
+                      'configuration_eligible_candidate', 'target_excluded_enabled',
+                      'unresolved_applicability', 'disabled_not_eligible')
+            rec['by_type'][kind] = {key: int(new.get(key, 0)) for key in fields}
+            totals[kind].update(rec['by_type'][kind])
+            targeting['no_explicit_target'] += no_target
+            targeting['explicit_target_eligible'] += eligible_target
+            targeting['explicit_target_excluded'] += excluded_target
+            targeting['unresolved_target'] += unresolved_target
+            enablement['disabled'] += disabled
+            enablement['enabled_or_unspecified'] += enabled
+            enablement['unknown_enablement'] += unknown
+        per_assignment.append(rec)
+    reference_total = sum(counter.get('candidate', 0) for counter in totals.values())
+    # Compare independently aggregated Preview 6 totals.
+    if reference_total != applicability.get('candidate_policy_references', 0):
+        issues['REFERENCE_TOTAL_MISMATCH'] += 1
+    for kind in kinds:
+        for key, value in applicability.get('by_type', {}).get(kind, {}).items():
+            if totals[kind].get(key, 0) != value:
+                issues['AGGREGATE_FIELD_MISMATCH'] += 1
+    unique = int(applicability.get('unique_policy_source_occurrences_referenced', 0))
+    raw_total = sum(int(raw.get(kind, 0)) for kind in kinds)
+    if raw_total and unique > raw_total:
+        issues['UNIQUE_SOURCE_EXCEEDS_RAW_INVENTORY'] += 1
+    if unique > reference_total:
+        issues['UNIQUE_SOURCE_EXCEEDS_REFERENCES'] += 1
+    if candidate.get('issues') or applicability.get('issues'):
+        issues['UPSTREAM_MAPPING_ISSUES'] += 1
+    return {
+        'schema_version': '0.1',
+        'status': 'PARTIAL' if issues or blocked else 'DIAGNOSTIC_ONLY',
+        'mode': 'candidate_accounting_and_targeting_coverage_audit',
+        'assignment_count': len(per_assignment), 'reconciled_assignments': sum(r['status'] == 'RECONCILED' for r in per_assignment),
+        'blocked_or_unresolved_assignments': blocked,
+        'issues': dict(sorted(issues.items())),
+        'raw_policy_entries': raw_total if raw else None,
+        'unique_source_occurrences_referenced': unique,
+        'candidate_policy_references': reference_total,
+        'reused_assignment_references': reference_total - unique,
+        'targeting_coverage': dict(sorted(targeting.items())),
+        'enablement_coverage': dict(sorted(enablement.items())),
+        'by_type': {k: dict(totals[k]) for k in kinds},
+        'assignments': per_assignment,
+        'effective_device_applicability': 'NOT_EVALUATED',
+        'limitations': [
+            'Diagnostic arithmetic and source identity do not establish effective or installed policy.',
+            'Targeting coverage describes assignments, not distinct rule occurrences.',
+            'No explicit target in XML is not proof of deployment.',
+            'Device-only assignments do not establish a specific VSYS.',
+            'Local policies, overrides, push status, template stacks and runtime state are not merged.',
+            'Assignment aliases are report-local; no customer device, VSYS or rule names are exported.'
+        ]
+    }
 
 
 def privacy_safe_panorama_diagnostics(diagnostics):
@@ -2829,13 +3670,18 @@ def normalized_configuration_diagnostics(scanner):
         ],
     }
 
-def scan_one(xml_path, out, baseline, privacy, formats=None, combined_writer=None):
+def scan_one(xml_path, out, baseline, privacy, formats=None, combined_writer=None, group_findings=True, combined_evidence_writer=None):
     formats = set(formats or ("html", "pdf", "csv", "json"))
     scanner = Scanner(xml_path, baseline)
     scanner.run()
     configuration_coverage = standalone_coverage_inventory(scanner)
     status, coverage_note = detect_coverage(scanner, configuration_coverage)
     data = scanner.output_data()
+    raw_findings = data["findings"]
+    data["metadata"]["detected_finding_count"] = len(raw_findings)
+    data["metadata"]["findings_grouped"] = bool(group_findings)
+    if group_findings:
+        data["findings"] = consolidate_findings(raw_findings)
     diagnostics = panorama_diagnostics(scanner)
     data["metadata"]["scan_status"] = status
     data["metadata"]["coverage_note"] = coverage_note
@@ -2844,6 +3690,7 @@ def scan_one(xml_path, out, baseline, privacy, formats=None, combined_writer=Non
     outputs = {
         "json": out / "H4wkEye-report.json",
         "csv": out / "H4wkEye-report.csv",
+        "evidence_csv": out / "H4wkEye-evidence.csv",
         "html": out / "H4wkEye-report.html",
         "pdf": out / "H4wkEye-report.pdf",
     }
@@ -2855,6 +3702,15 @@ def scan_one(xml_path, out, baseline, privacy, formats=None, combined_writer=Non
     diagnostic_export["reference_audit"] = audit_policy_references(scanner)
     diagnostic_export["normalized_model"] = normalized_configuration_diagnostics(scanner)
     diagnostic_export["configuration_coverage"] = configuration_coverage
+    diagnostic_export["panorama_inheritance_preview"] = panorama_inheritance_preview(scanner) if diagnostics.get("device_groups") else None
+    diagnostic_export["panorama_targeting_preview"] = panorama_targeting_preview(scanner) if diagnostics.get("device_groups") else None
+    diagnostic_export["panorama_membership_preview"] = panorama_membership_preview(scanner) if diagnostics.get("device_groups") else None
+    diagnostic_export["panorama_candidate_mapping_preview"] = panorama_candidate_mapping_preview(scanner) if diagnostics.get("device_groups") else None
+    diagnostic_export["panorama_applicability_preview"] = panorama_applicability_preview(scanner) if diagnostics.get("device_groups") else None
+    diagnostic_export["panorama_reconciliation_preview"] = panorama_reconciliation_preview(
+        diagnostic_export["panorama_candidate_mapping_preview"],
+        diagnostic_export["panorama_applicability_preview"],
+        diagnostic_export.get("raw_policy_entries")) if diagnostics.get("device_groups") else None
     diagnostic_export["address_resolution"] = {
         "strategy": "exact-policy-scope-then-shared; no unrelated device-group fallback",
         "counts": dict(scanner.resolution_statistics),
@@ -2869,11 +3725,19 @@ def scan_one(xml_path, out, baseline, privacy, formats=None, combined_writer=Non
         config_label = (xml_path.name if privacy == "standard" else
                         hashlib.sha256(xml_path.name.encode()).hexdigest()[:12])
         for finding in data["findings"]:
-            combined_writer.writerow({**finding, "configuration": config_label, "scan_status": status})
+            summary_row = dict(finding)
+            summary_row["original_finding_ids"] = ";".join(finding.get("original_finding_ids", []))
+            combined_writer.writerow({**summary_row, "configuration": config_label, "scan_status": status})
+    if combined_evidence_writer is not None:
+        config_label = (xml_path.name if privacy == "standard" else
+                        hashlib.sha256(xml_path.name.encode()).hexdigest()[:12])
+        for row in evidence_rows(data["findings"]):
+            combined_evidence_writer.writerow({**row, "configuration": config_label, "scan_status": status})
     if "json" in formats:
         write_json(outputs["json"], data)
     if "csv" in formats:
         write_csv(outputs["csv"], data["findings"])
+        write_evidence_csv(outputs["evidence_csv"], data["findings"])
     if "html" in formats:
         write_html(outputs["html"], data)
     pdf_error = None
@@ -2906,6 +3770,7 @@ def scan_one(xml_path, out, baseline, privacy, formats=None, combined_writer=Non
         "policy_count_mismatch": diagnostics["policy_count_mismatch"],
         "pdf_error": pdf_error,
         "findings": len(data["findings"]),
+        "detected_findings": len(raw_findings),
         "severity": dict(Counter(f["severity"] for f in data["findings"])),
         "output_folder": out.name if privacy == "standard" else "pseudonymized",
     }
@@ -2923,6 +3788,8 @@ def main():
                         help="Maximum XML input size in MiB (default: 100; maximum: 2048)")
     parser.add_argument("--format", "--formats", dest="formats", default="all",
                         help="Report format(s): all (default), pdf, html, csv, json; comma-separated allowed, e.g. pdf,csv")
+    parser.add_argument("--no-group-findings", action="store_true",
+                        help="Keep one report finding per original detection (disable default consolidation)")
     parser.add_argument("--combined-csv", action="store_true",
                         help="Batch mode: also generate one combined-findings.csv with findings from all successfully scanned XML files; independent of --format")
     parser.add_argument("--recursive", action="store_true",
@@ -2962,7 +3829,8 @@ def main():
             return 2
         out = Path(args.output or ".")
         try:
-            result = scan_one(path, out, baseline, args.privacy, selected_formats)
+            result = scan_one(path, out, baseline, args.privacy, selected_formats,
+                              group_findings=not args.no_group_findings)
         except Exception as exc:
             print(f"[!] Scan failed: {type(exc).__name__}: {exc}", file=sys.stderr)
             return 4
@@ -2989,20 +3857,31 @@ def main():
     results = []
     combined_file = None
     combined_writer = None
+    evidence_file = None
+    combined_evidence_writer = None
     combined_path = batch / "combined-findings.csv"
+    combined_evidence_path = batch / "combined-evidence.csv"
     if args.combined_csv:
         combined_file = open(combined_path, "w", newline="", encoding="utf-8-sig")
         combined_writer = csv.DictWriter(
             combined_file, fieldnames=["configuration", "scan_status", *csv_fields()],
             extrasaction="ignore")
         combined_writer.writeheader()
+        evidence_file = open(combined_evidence_path, "w", newline="", encoding="utf-8-sig")
+        evidence_fields = ["configuration", "scan_status", "finding_id", "title", "severity",
+                          "section", "affected_count", "original_finding_id", *REPORT_EVIDENCE_FIELDS]
+        combined_evidence_writer = csv.DictWriter(evidence_file, fieldnames=evidence_fields,
+                                                 extrasaction="ignore")
+        combined_evidence_writer.writeheader()
     for index, path in enumerate(files, 1):
         # Numbered names avoid collisions; strict mode never writes source names.
         safe_name = re.sub(r"[^A-Za-z0-9._-]", "_", path.stem)[:70].strip("._") or "config"
         dirname = f"{index:03d}_{safe_name}" if args.privacy == "standard" else f"{index:03d}_config"
         out = batch / dirname
         try:
-            result = scan_one(path, out, baseline, args.privacy, selected_formats, combined_writer)
+            result = scan_one(path, out, baseline, args.privacy, selected_formats,
+                              combined_writer, group_findings=not args.no_group_findings,
+                              combined_evidence_writer=combined_evidence_writer)
         except Exception as exc:
             # Surface the real error without exposing XML content or credentials.
             error_detail = (str(exc) if str(exc).startswith("EMPTY_FILE:")
@@ -3020,10 +3899,14 @@ def main():
     if combined_file is not None:
         combined_file.close()
         chmod_private(combined_path)
+    if evidence_file is not None:
+        evidence_file.close()
+        chmod_private(combined_evidence_path)
     summary = {"scanner": "H4wkEye", "version": VERSION,
                "generated": datetime.now().isoformat(timespec="seconds"),
                "privacy_mode": args.privacy, "files": results,
                "combined_csv": "combined-findings.csv" if args.combined_csv else None,
+               "combined_evidence_csv": "combined-evidence.csv" if args.combined_csv else None,
                "status_counts": dict(Counter(r["status"] for r in results))}
     summary_path = batch / "batch-summary.json"
     write_json(summary_path, summary)
